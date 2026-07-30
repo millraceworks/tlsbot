@@ -3,4 +3,5 @@
 .bot.lock
 .verify-pending.json
 .links.json
+.split.json
 node_modules/

@@ -64,7 +64,10 @@ the icon can be switched back immediately after.
 - **🎉 Promotion celebrations** — a tier promotion posts a congratulations
   (with @mention) to `CELEBRATE_CHANNEL_ID` (default: the log channel), **once
   per tier per split**: demote-then-repromote stays quiet (Goonmaster's spec).
-  Dedup state lives on the member's link under `SPLIT_KEY`; bump the key in
-  `.env` at each new ranked split to reset the slate.
+  Dedup state lives on the member's link under the current split key. **Split
+  rollover is automatic**: a once-daily canary checks the Challenger ladder
+  size (~300 all split, near-zero right after a reset); on collapse the bot
+  rolls its split key, resets the slate, and announces it in the log channel.
+  `SPLIT_KEY` in `.env` is a manual override that disables auto-detection.
 - `scripts/whoami.mjs` — token + guild sanity check. `register.mjs` — manual
   command re-registration (recovery only; normally automatic).

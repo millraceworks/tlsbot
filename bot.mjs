@@ -33,10 +33,16 @@ import {
   getSummoner,
   soloEntry,
   activeGame,
+  challengerLadderSize,
   profileIconUrl,
 } from "./lib/riot.mjs";
 
-const { appId, logChannelId, celebrateChannelId, splitKey } = creds();
+const {
+  appId,
+  logChannelId,
+  celebrateChannelId,
+  splitKey: envSplitKey,
+} = creds();
 
 const log = (m) =>
   process.stderr.write(`[tlsbot ${new Date().toISOString()}] ${m}\n`);
@@ -569,6 +575,54 @@ function saveLinks() {
   }
 }
 
+// Split state: current split key + the canary baseline. SPLIT_KEY in .env pins
+// it manually (auto-detect off); otherwise a once-daily Challenger-ladder size
+// check rolls the key automatically when a reset is detected — the ladder sits
+// ~300 all split and collapses to near-zero the day a new split starts.
+const SPLIT_FILE = join(ROOT, ".split.json");
+let splitState = { key: "2026-split-2", ladder: 0 };
+try {
+  splitState = {
+    ...splitState,
+    ...JSON.parse(readFileSync(SPLIT_FILE, "utf8")),
+  };
+} catch {
+  /* first run */
+}
+function saveSplit() {
+  try {
+    writeFileSync(SPLIT_FILE, JSON.stringify(splitState));
+  } catch {
+    /* best-effort */
+  }
+}
+const currentSplit = () => envSplitKey || splitState.key;
+
+async function checkSplitRollover() {
+  if (envSplitKey) return; // pinned manually in .env — auto-detection off
+  try {
+    const platform = Object.values(links)[0]?.platform || "na1";
+    const size = await challengerLadderSize(platform);
+    if (splitState.ladder >= 100 && size < 30) {
+      splitState.key = `auto-${new Date().toISOString().slice(0, 10)}`;
+      log(
+        `split rollover detected (challenger ladder ${splitState.ladder} -> ${size}) — new key ${splitState.key}`,
+      );
+      for (const gid of new Set(Object.values(links).map((l) => l.gid)))
+        logLine(
+          gid,
+          "🔄 New ranked split detected — celebration slate reset; first tier promotions get their 🎉 again.",
+        );
+    }
+    splitState.ladder = size;
+    saveSplit();
+  } catch (e) {
+    log(`split canary failed (non-fatal): ${e.message}`);
+  }
+}
+setInterval(checkSplitRollover, 24 * 60 * 60 * 1000);
+setTimeout(checkSplitRollover, 90_000);
+
 const rankScore = (tier, division) => {
   const ti = RANKS.findIndex(
     (r) => r.name.toUpperCase() === String(tier || "").toUpperCase(),
@@ -641,7 +695,7 @@ async function refreshLink(uid, why) {
         );
       if (changedTier && ti(link.tier) > ti(beforeTier)) {
         link.celebrated ??= {};
-        const done = (link.celebrated[splitKey] ??= []);
+        const done = (link.celebrated[currentSplit()] ??= []);
         if (!done.includes(link.tier)) {
           done.push(link.tier);
           saveLinks();
