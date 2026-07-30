@@ -6,17 +6,23 @@ roles, swaps the old rank out, and logs every change to `#bot-logging`.
 
 ## Commands
 
-| Command      | Who  | What                                                                 |
-| ------------ | ---- | -------------------------------------------------------------------- |
-| `/verify`    | all  | Verify your REAL solo/duo rank via Riot ID (`Name#TAG` + region)     |
-| `/ranksetup` | mods | Create any missing rank roles — colored, zero permissions, unhoisted |
-| `/rankpanel` | mods | Post the persistent picker panel (pin it) — self-report fallback     |
+| Command      | Who  | What                                                                  |
+| ------------ | ---- | --------------------------------------------------------------------- |
+| `/verify`    | all  | Prove you own a Riot ID (icon handshake), get your REAL solo/duo rank |
+| `/ranksetup` | mods | Create any missing rank roles — colored, zero permissions, unhoisted  |
+| `/rankpanel` | mods | Post the persistent picker panel (pin it) — self-report fallback      |
 
 There is deliberately no `/rank` command (owner preference): the panel covers
 self-reported picks (Iron → Challenger, plus "Clear my rank"), and `/verify` is
 the flagship — the rank comes from the Riot API (`RIOT_API_KEY` in `.env`,
 re-read on every call so rotating the 24h dev key needs no restart), not from
 the member's imagination.
+
+`/verify` enforces **ownership**, not just existence: it challenges the member
+to switch their summoner icon to a random starter icon (never the one they're
+wearing), then re-checks via summoner-v4 before applying the rank — so claiming
+someone else's account fails. Challenges live in memory with a 15-minute TTL;
+the icon can be switched back immediately after.
 
 ## Setup
 

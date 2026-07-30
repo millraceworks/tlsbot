@@ -28,7 +28,12 @@ import {
   rolePayload,
 } from "./lib/ranks.mjs";
 import { COMMANDS } from "./lib/commands.mjs";
-import { lookupSoloRank } from "./lib/riot.mjs";
+import {
+  lookupAccount,
+  getSummoner,
+  soloEntry,
+  profileIconUrl,
+} from "./lib/riot.mjs";
 
 const { appId, logChannelId } = creds();
 
@@ -275,10 +280,24 @@ async function handlePick(d) {
 // /verify riot_id:<Name#TAG> [region] — the flagship: pull the REAL solo/duo
 // rank from the Riot API and apply the crest role. Self-reported rank is junk
 // data; this is the thing native onboarding and off-the-shelf bots don't do.
+// Ownership challenges awaiting the icon handshake: userId -> challenge.
+// In-memory on purpose: a restart just means re-running /verify (15-min TTL).
+const pendingVerify = new Map();
+const VERIFY_TTL_MS = 15 * 60 * 1000;
+// Icons 0-28 are the classic starters every account owns.
+const STARTER_ICONS = Array.from({ length: 29 }, (_, i) => i);
+
+const riotErrorText = (e, who, platform) => {
+  if (e.riot === "nokey" || e.status === 401 || e.status === 403)
+    return "⚠️ The Riot API key is missing or expired — a mod needs to refresh it (dev keys last 24h).";
+  if (e.status === 404 && who)
+    return `⚠️ Couldn't find **${who}** — check the spelling and tag, and the region (this looked in ${platform.toUpperCase()}).`;
+  return null;
+};
+
 async function handleVerify(d) {
   // Riot round-trips can outrun the 3s callback window — defer immediately.
   await respond(d, { type: 5, data: { flags: 64 } });
-  const gid = d.guild_id;
   const opts = Object.fromEntries(
     (d.data.options || []).map((o) => [o.name, o.value]),
   );
@@ -294,51 +313,122 @@ async function handleVerify(d) {
   const tagLine = raw.slice(hash + 1).trim();
 
   try {
-    const { account, solo } = await lookupSoloRank({
-      gameName,
-      tagLine,
-      platform,
-    });
+    const account = await lookupAccount({ gameName, tagLine });
+    const summ = await getSummoner({ puuid: account.puuid, platform });
     const riotId = `${account.gameName}#${account.tagLine}`;
+    // Ownership handshake: demand a starter icon they're NOT currently wearing,
+    // so a stale/lucky match can never pass someone claiming another's account.
+    const pool = STARTER_ICONS.filter((i) => i !== summ.profileIconId);
+    const iconId = pool[Math.floor(Math.random() * pool.length)];
+    pendingVerify.set(d.member.user.id, {
+      puuid: account.puuid,
+      riotId,
+      platform,
+      iconId,
+      expires: Date.now() + VERIFY_TTL_MS,
+    });
+    await editOriginal(d, {
+      content:
+        `Found **${riotId}** (${platform.toUpperCase()}). Now prove it's yours:\n` +
+        `1. In the League client, open your profile → change your **summoner icon** to the starter icon shown here (icon **#${iconId}**).\n` +
+        `2. Come back and press **Check** — I'll confirm it via the Riot API and apply your real rank.\n` +
+        `-# You can switch your icon back right after. Challenge expires in 15 minutes.`,
+      embeds: [
+        {
+          title: `Set this icon: #${iconId}`,
+          thumbnail: { url: await profileIconUrl(iconId) },
+          color: 0x5ca8e8,
+        },
+      ],
+      components: [
+        {
+          type: 1,
+          components: [
+            {
+              type: 2,
+              style: 3,
+              label: "Check — I changed it",
+              custom_id: "verify:check",
+            },
+          ],
+        },
+      ],
+    });
+  } catch (e) {
+    const friendly = riotErrorText(e, `${gameName}#${tagLine}`, platform);
+    if (friendly) return editOriginal(d, { content: friendly });
+    throw e; // anything else -> onInteraction's catch (errorReply edits the deferred msg)
+  }
+}
+
+// The "Check" button: re-fetch the summoner; the icon matching the challenge
+// proves account control, and only then does the rank role get applied.
+async function handleVerifyCheck(d) {
+  const uid = d.member.user.id;
+  const challenge = pendingVerify.get(uid);
+  if (!challenge || challenge.expires < Date.now()) {
+    pendingVerify.delete(uid);
+    return respond(d, {
+      type: 4,
+      data: {
+        flags: 64,
+        content:
+          "⏱️ No active verification (or it expired) — run `/verify` again to restart.",
+      },
+    });
+  }
+  // Deferred UPDATE (type 6): Riot calls + role ops can outrun the 3s window.
+  await respond(d, { type: 6 });
+  const { puuid, riotId, platform, iconId } = challenge;
+  try {
+    const summ = await getSummoner({ puuid, platform });
+    if (summ.profileIconId !== iconId)
+      return editOriginal(d, {
+        content:
+          `Not yet — **${riotId}** is currently wearing icon **#${summ.profileIconId}**, I asked for **#${iconId}**.\n` +
+          `Change it in the client, wait a few seconds (Riot's API can lag a little), and press **Check** again.`,
+      });
+    // Ownership proven — now the rank.
+    const solo = await soloEntry({ puuid, platform });
+    pendingVerify.delete(uid);
     if (!solo)
       return editOriginal(d, {
-        content: `Found **${riotId}**, but no ranked solo/duo entry this season — no rank role to apply. Play placements and re-run \`/verify\`.`,
+        content: `✅ Ownership of **${riotId}** verified — but no ranked solo/duo entry this season, so there's no rank role to apply. Play placements and re-run \`/verify\`.`,
+        embeds: [],
+        components: [],
       });
     const rankKey = String(solo.tier || "").toLowerCase();
     if (!RANK_BY_KEY.has(rankKey))
       return editOriginal(d, {
         content: `⚠️ Riot returned an unexpected tier ("${solo.tier}") — tell a mod.`,
+        embeds: [],
+        components: [],
       });
     const { rank, was } = await swapToRank(
-      gid,
+      d.guild_id,
       d.member,
       rankKey,
-      `rank verified via Riot API (${riotId}, ${platform})`,
+      `rank verified via Riot icon handshake (${riotId}, ${platform})`,
     );
     const division = ["MASTER", "GRANDMASTER", "CHALLENGER"].includes(solo.tier)
       ? ""
       : ` ${solo.rank}`;
     const label = `${rank.name}${division} · ${solo.leaguePoints} LP`;
     await editOriginal(d, {
-      content: `${emojiText(rank)} Verified: **${riotId}** is **${label}** — role applied.`,
+      content: `${emojiText(rank)} Verified owner of **${riotId}** — **${label}**. Role applied; feel free to switch your icon back.`,
+      embeds: [],
+      components: [],
     });
     logLine(
-      gid,
-      `✅ ${emojiText(rank)} **${displayName(d.member)}** verified as **${riotId}** — ${label}${
+      d.guild_id,
+      `✅ ${emojiText(rank)} **${displayName(d.member)}** verified as **${riotId}** (icon handshake) — ${label}${
         was.length && was[0] !== rank.name ? ` (was ${was.join(", ")})` : ""
       }`,
     );
   } catch (e) {
-    if (e.riot === "nokey" || e.status === 401 || e.status === 403)
-      return editOriginal(d, {
-        content:
-          "⚠️ The Riot API key is missing or expired — a mod needs to refresh it (dev keys last 24h).",
-      });
-    if (e.status === 404)
-      return editOriginal(d, {
-        content: `⚠️ Couldn't find **${gameName}#${tagLine}** — check the spelling and tag, and the region (this looked in ${platform.toUpperCase()}).`,
-      });
-    throw e; // anything else -> onInteraction's catch (errorReply edits the deferred msg)
+    const friendly = riotErrorText(e, riotId, platform);
+    if (friendly) return editOriginal(d, { content: friendly });
+    throw e;
   }
 }
 
@@ -422,6 +512,8 @@ async function onInteraction(d) {
     }
     if (d.type === 3 && d.data.custom_id === "rank:pick")
       return await handlePick(d);
+    if (d.type === 3 && d.data.custom_id === "verify:check")
+      return await handleVerifyCheck(d);
   } catch (e) {
     log(`interaction failed: ${e.message}`);
     await errorReply(
