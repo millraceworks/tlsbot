@@ -5,13 +5,19 @@
 // answered via REST callbacks. Commands are (re-)registered idempotently per guild on
 // every GUILD_CREATE, so inviting the bot to a server is the ONLY setup step.
 //
-//   /rank       everyone  — ephemeral rank picker (select menu, swaps old rank out)
-//   /ranksetup  mods      — create any missing rank roles (colored, zero permissions)
-//   /rankpanel  mods      — post a persistent picker panel in the current channel
+//   /ranksetup  mods — create any missing rank roles (colored, zero permissions)
+//   /rankpanel  mods — post the persistent picker panel (the ONLY member
+//                      interface; there is deliberately no /rank command)
+//
+// The picker shows Riot's official rank crests via APPLICATION-owned emojis
+// (uploaded once by scripts/upload-emojis.mjs). When a guild has the boost-gated
+// ROLE_ICONS feature, /ranksetup also stamps the crest onto each role itself.
 //
 // Role changes carry X-Audit-Log-Reason, and each change is echoed to #bot-logging
 // (or LOG_CHANNEL_ID) when such a channel exists.
-import { creds } from "./lib/env.mjs";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { creds, ROOT } from "./lib/env.mjs";
 import { rest } from "./lib/rest.mjs";
 import {
   RANKS,
@@ -19,6 +25,7 @@ import {
   RANK_NAME_SET,
   rolePayload,
 } from "./lib/ranks.mjs";
+import { COMMANDS } from "./lib/commands.mjs";
 
 const { appId, logChannelId } = creds();
 
@@ -26,23 +33,6 @@ const log = (m) =>
   process.stderr.write(`[tlsbot ${new Date().toISOString()}] ${m}\n`);
 
 // --- commands (registered per guild — instant, unlike global) -------------------
-const MANAGE_ROLES = "268435456";
-const COMMANDS = [
-  { name: "rank", type: 1, description: "Pick your League rank role" },
-  {
-    name: "ranksetup",
-    type: 1,
-    description: "Create the rank roles (mods only)",
-    default_member_permissions: MANAGE_ROLES,
-  },
-  {
-    name: "rankpanel",
-    type: 1,
-    description: "Post a rank-picker panel in this channel (mods only)",
-    default_member_permissions: MANAGE_ROLES,
-  },
-];
-
 async function registerCommands(guildId) {
   await rest("PUT", `/applications/${appId}/guilds/${guildId}/commands`, {
     body: COMMANDS,
@@ -50,8 +40,39 @@ async function registerCommands(guildId) {
   log(`commands registered in guild ${guildId}`);
 }
 
+// --- application-owned rank-crest emojis ----------------------------------------
+// Uploaded once by scripts/upload-emojis.mjs as rank_<key>; resolved by name at
+// startup. Falls back to the unicode glyphs if an upload is ever missing.
+const appEmoji = new Map(); // rank key -> emoji id
+
+async function loadAppEmojis() {
+  try {
+    const listing = await rest("GET", `/applications/${appId}/emojis`);
+    const items = Array.isArray(listing) ? listing : listing.items || [];
+    for (const e of items) {
+      const m = /^rank_(\w+)$/.exec(e.name);
+      if (m && RANK_BY_KEY.has(m[1])) appEmoji.set(m[1], e.id);
+    }
+    log(`app emojis loaded (${appEmoji.size}/${RANKS.length} crests)`);
+  } catch (e) {
+    log(`app-emoji load failed (falling back to unicode): ${e.message}`);
+  }
+}
+
+// Component-shaped emoji ({id} = custom crest, {name} = unicode fallback), and
+// the in-message-text form of the same.
+const emojiObj = (rank) =>
+  appEmoji.has(rank.key)
+    ? { id: appEmoji.get(rank.key), name: `rank_${rank.key}` }
+    : { name: rank.emoji };
+const emojiText = (rank) =>
+  appEmoji.has(rank.key)
+    ? `<:rank_${rank.key}:${appEmoji.get(rank.key)}>`
+    : rank.emoji;
+
 // --- logging to #bot-logging ----------------------------------------------------
 const logChannels = new Map(); // guildId -> channelId | null
+const guildFeatures = new Map(); // guildId -> Set of feature flags (ROLE_ICONS…)
 
 function cacheLogChannel(guild) {
   if (logChannelId) {
@@ -108,7 +129,7 @@ const selectRow = () => ({
         ...RANKS.map((r) => ({
           label: r.name,
           value: r.key,
-          emoji: { name: r.emoji },
+          emoji: emojiObj(r),
         })),
         { label: "Clear my rank", value: "clear", emoji: { name: "🧹" } },
       ],
@@ -117,18 +138,6 @@ const selectRow = () => ({
 });
 
 // --- handlers -------------------------------------------------------------------
-async function handleRank(d) {
-  await respond(d, {
-    type: 4,
-    data: {
-      flags: 64,
-      content:
-        "**Pick your League rank** — your old rank role swaps out automatically.",
-      components: [selectRow()],
-    },
-  });
-}
-
 async function handlePick(d) {
   const gid = d.guild_id;
   const member = d.member;
@@ -167,7 +176,7 @@ async function handlePick(d) {
       await rest("PUT", `/guilds/${gid}/members/${uid}/roles/${target.id}`, {
         reason: "rank set via /rank",
       });
-    confirmation = `${rank.emoji} You're now **${rank.name}**.`;
+    confirmation = `${emojiText(rank)} You're now **${rank.name}**.`;
   }
 
   // From the ephemeral /rank flow: update that message in place. From a shared
@@ -185,7 +194,7 @@ async function handlePick(d) {
     gid,
     value === "clear"
       ? `🧹 **${displayName(member)}** cleared their rank${was ? ` (was ${was})` : ""}`
-      : `🎖️ **${displayName(member)}** → **${RANK_BY_KEY.get(value).name}**${
+      : `${emojiText(RANK_BY_KEY.get(value))} **${displayName(member)}** → **${RANK_BY_KEY.get(value).name}**${
           was && was !== RANK_BY_KEY.get(value).name ? ` (was ${was})` : ""
         }`,
   );
@@ -210,10 +219,34 @@ async function handleSetup(d) {
     });
     created.push(rank.name);
   }
+  // Where the guild has the boost-gated ROLE_ICONS feature, stamp the official
+  // crest onto each rank role itself (skipped silently elsewhere — the crests
+  // still show in the picker via app emojis).
+  let iconNote = "";
+  if (guildFeatures.get(gid)?.has("ROLE_ICONS")) {
+    const fresh = await rest("GET", `/guilds/${gid}/roles`);
+    let stamped = 0;
+    for (const role of fresh) {
+      const rank = RANKS.find((r) => r.name === role.name);
+      if (!rank || role.icon) continue;
+      const png = readFileSync(
+        join(ROOT, "assets", "ranks", `${rank.key}.png`),
+      );
+      await rest("PATCH", `/guilds/${gid}/roles/${role.id}`, {
+        body: { icon: `data:image/png;base64,${png.toString("base64")}` },
+        reason: "/ranksetup — official crest as role icon",
+      });
+      stamped++;
+    }
+    if (stamped)
+      iconNote = ` Stamped the official crest icon onto ${stamped} role${stamped === 1 ? "" : "s"}.`;
+  }
+
   await editOriginal(d, {
-    content: created.length
-      ? `✅ Created ${created.length} rank role${created.length === 1 ? "" : "s"}: ${created.join(", ")}. They carry zero permissions and sit below my role, so I can manage them.`
-      : "✅ All 10 rank roles already exist — nothing to create.",
+    content:
+      (created.length
+        ? `✅ Created ${created.length} rank role${created.length === 1 ? "" : "s"}: ${created.join(", ")}. They carry zero permissions and sit below my role, so I can manage them.`
+        : "✅ All 10 rank roles already exist — nothing to create.") + iconNote,
   });
   if (created.length)
     logLine(
@@ -227,7 +260,7 @@ async function handlePanel(d) {
     type: 4,
     data: {
       content:
-        "**Choose your League rank**\nPick from the menu below — your old rank role is swapped out automatically. Run `/rank` anywhere to change it later.",
+        "**Choose your League rank**\nPick from the menu below — your old rank role is swapped out automatically. Come back here any time to change it.",
       components: [selectRow()],
     },
   });
@@ -240,7 +273,6 @@ async function handlePanel(d) {
 async function onInteraction(d) {
   try {
     if (d.type === 2) {
-      if (d.data.name === "rank") return await handleRank(d);
       if (d.data.name === "ranksetup") return await handleSetup(d);
       if (d.data.name === "rankpanel") return await handlePanel(d);
       return;
@@ -348,6 +380,7 @@ function connect() {
     }
     if (t === "GUILD_CREATE") {
       log(`guild available: ${d.name} (${d.id})`);
+      guildFeatures.set(d.id, new Set(d.features || []));
       cacheLogChannel(d);
       registerCommands(d.id).catch((e) =>
         log(`command registration failed for ${d.id}: ${e.message}`),
@@ -379,4 +412,5 @@ function connect() {
 }
 
 log("starting TLSBot");
+await loadAppEmojis();
 connect();

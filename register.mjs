@@ -4,24 +4,9 @@
 // standalone for recovery / offline registration.
 import { creds } from "./lib/env.mjs";
 import { rest } from "./lib/rest.mjs";
+import { COMMANDS } from "./lib/commands.mjs";
 
 const { appId } = creds();
-const MANAGE_ROLES = "268435456";
-const COMMANDS = [
-  { name: "rank", type: 1, description: "Pick your League rank role" },
-  {
-    name: "ranksetup",
-    type: 1,
-    description: "Create the rank roles (mods only)",
-    default_member_permissions: MANAGE_ROLES,
-  },
-  {
-    name: "rankpanel",
-    type: 1,
-    description: "Post a rank-picker panel in this channel (mods only)",
-    default_member_permissions: MANAGE_ROLES,
-  },
-];
 
 const guilds = await rest("GET", "/users/@me/guilds");
 if (!guilds.length) {

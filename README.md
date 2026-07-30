@@ -8,9 +8,11 @@ roles, swaps the old rank out, and logs every change to `#bot-logging`.
 
 | Command      | Who  | What                                                                 |
 | ------------ | ---- | -------------------------------------------------------------------- |
-| `/rank`      | all  | Ephemeral rank picker (Iron → Challenger, plus "Clear my rank")      |
 | `/ranksetup` | mods | Create any missing rank roles — colored, zero permissions, unhoisted |
-| `/rankpanel` | mods | Post a persistent picker panel in the current channel (pin it)       |
+| `/rankpanel` | mods | Post the persistent picker panel (pin it) — the member interface     |
+
+There is deliberately no `/rank` command (owner preference): the panel is the one
+way members pick a rank (Iron → Challenger, plus "Clear my rank").
 
 ## Setup
 
@@ -22,11 +24,18 @@ roles, swaps the old rank out, and logs every change to `#bot-logging`.
 
 ## Design notes
 
+- **Official Riot crests everywhere** — the picker, confirmations, and log lines
+  use Riot's ranked emblems (from the official developer asset pack) uploaded as
+  **application-owned emojis** (`scripts/upload-emojis.mjs`, idempotent). App
+  emojis work in ANY server with zero boost requirement and consume no guild
+  emoji slots. Where a guild has the boost-gated `ROLE_ICONS` feature (level 2),
+  `/ranksetup` also stamps the crest onto each role itself; elsewhere that step
+  is skipped silently.
 - **No privileged intents** — slash commands + components aren't intent-gated;
   the bot never reads messages or the member list.
 - **Rank roles carry `permissions: "0"`** and are created _by_ the bot, so they
   land below the bot's own role and hierarchy always works. If roles were made by
-  hand above the bot's role, `/rank` replies with the exact drag-to-fix hint.
+  hand above the bot's role, the picker replies with the exact drag-to-fix hint.
 - **Every role change carries `X-Audit-Log-Reason`** — attributable in the
   server's audit log, plus a human-readable line in `#bot-logging`.
 - `scripts/whoami.mjs` — token + guild sanity check. `register.mjs` — manual
