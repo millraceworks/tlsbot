@@ -32,6 +32,7 @@ import {
   lookupAccount,
   getSummoner,
   soloEntry,
+  activeGame,
   profileIconUrl,
 } from "./lib/riot.mjs";
 
@@ -657,6 +658,39 @@ function onPresence(d) {
   log(`presence: linked member ${uid} finished a League session`);
   setTimeout(() => refreshLink(uid, "game ended"), REFRESH_DELAY_MS);
 }
+
+// THE universal game-end detector (Riot-side, works for every linked member):
+// poll spectator-v5 per link on a cycle; an in-game -> not-in-game transition
+// means the game just ended, so refresh ~90s later when the ladder has it.
+// Discord presence (above) remains only as a free accelerator for members who
+// happen to share activity — this loop needs nothing from anyone's settings.
+const SPECTATE_INTERVAL_MS = 2 * 60 * 1000;
+const inLiveGame = new Set();
+async function pollLiveGames() {
+  for (const [uid, link] of Object.entries(links)) {
+    try {
+      const game = await activeGame({
+        puuid: link.puuid,
+        platform: link.platform,
+      });
+      if (game) {
+        if (!inLiveGame.has(uid)) {
+          inLiveGame.add(uid);
+          log(`spectator: ${link.riotId} is in a live game`);
+        }
+      } else if (inLiveGame.has(uid)) {
+        inLiveGame.delete(uid);
+        log(`spectator: ${link.riotId} finished a game — refresh in 90s`);
+        setTimeout(() => refreshLink(uid, "game ended"), 90_000);
+      }
+    } catch (e) {
+      log(`spectator poll (${link.riotId}) failed (non-fatal): ${e.message}`);
+    }
+    await new Promise((r) => setTimeout(r, 1500));
+  }
+  setTimeout(pollLiveGames, SPECTATE_INTERVAL_MS);
+}
+setTimeout(pollLiveGames, 15_000);
 
 // Hourly safety net: catches ranks that changed while the bot was down or the
 // member played invisible/offline. Sequential with spacing — rate-limit kind.

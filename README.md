@@ -49,14 +49,17 @@ the icon can be switched back immediately after.
 - **Every role change carries `X-Audit-Log-Reason`** — attributable in the
   server's audit log, plus a human-readable line in `#bot-logging`.
 - **Ranks stay current on their own** — a successful `/verify` stores a link
-  (`.links.json`, flat file — no database at this scale) and from then on: the
-  **presence layer** (privileged Presence Intent, portal toggle) notices a
-  linked member's League session ending and refreshes them ~2.5 min later —
-  near-realtime, zero API waste on people not playing; an **hourly sweep**
-  catches anything presence missed (bot downtime, invisible mode). Tier changes
-  swap the role; tier/division moves post 📈/📉 climb/fall lines to
-  `#bot-logging`; LP-only drift updates silently. There is deliberately no
-  `/update` command — the automation makes it redundant. Riot has no push API;
-  "realtime" is well-aimed polling.
+  (`.links.json`, flat file — no database at this scale) and from then on,
+  three layers keep it fresh, fastest first: (1) **spectator polling** — the
+  universal Riot-side game detector: every ~2 min the bot asks spectator-v5
+  whether each linked account is in a live game; an in-game → not-in-game
+  transition refreshes the rank ~90s later. Works for everyone, no Discord
+  settings involved. (2) **Discord presence** (privileged intent, portal
+  toggle) — a free accelerator for members who share game activity; opt-in on
+  the member's side, never relied on. (3) **hourly sweep** — catches whatever
+  slipped past (bot downtime, LP from dodges). Tier changes swap the role;
+  changes post 📈/📉 lines to `#bot-logging` (currently verbose incl. LP-only,
+  for testing). No `/update` command — the automation makes it redundant. Riot
+  has no push API; "realtime" is well-aimed polling.
 - `scripts/whoami.mjs` — token + guild sanity check. `register.mjs` — manual
   command re-registration (recovery only; normally automatic).
