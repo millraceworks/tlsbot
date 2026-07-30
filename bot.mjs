@@ -577,7 +577,9 @@ function rankLabel(link) {
 }
 
 // Re-pull one linked account. Tier change -> role swap; any tier/division
-// movement -> a climb/fall line in #bot-logging. LP-only drift stores silently.
+// movement -> a climb/fall line in #bot-logging. LP-only changes log too for
+// now (Noah 2026-07-30: verbose while testing; quiet them for a big server by
+// restoring the `if (!changedDiv) return` early-out).
 const refreshing = new Set();
 async function refreshLink(uid, why) {
   const link = links[uid];
@@ -591,14 +593,16 @@ async function refreshLink(uid, why) {
     if (!solo) return; // decayed/reset to unranked — keep the last role for now
     const changedTier = solo.tier !== link.tier;
     const changedDiv = changedTier || solo.rank !== link.division;
+    const changedLp = solo.leaguePoints !== link.lp;
     const beforeLabel = rankLabel(link);
     const beforeScore = rankScore(link.tier, link.division);
+    const beforeLp = link.lp;
     link.tier = solo.tier;
     link.division = solo.rank;
     link.lp = solo.leaguePoints;
     link.updatedAt = Date.now();
     saveLinks();
-    if (!changedDiv) return;
+    if (!changedDiv && !changedLp) return;
     const rank = RANK_BY_KEY.get(String(solo.tier).toLowerCase());
     if (!rank) return;
     const member = await rest("GET", `/guilds/${link.gid}/members/${uid}`);
@@ -609,11 +613,19 @@ async function refreshLink(uid, why) {
         rank.key,
         `rank auto-refresh (${why})`,
       );
-    const up = rankScore(link.tier, link.division) >= beforeScore;
-    logLine(
-      link.gid,
-      `${up ? "📈" : "📉"} ${emojiText(rank)} **${displayName(member)}** ${up ? "climbed" : "fell"}: **${beforeLabel}** → **${rankLabel(link)}** (${solo.leaguePoints} LP)`,
-    );
+    if (changedDiv) {
+      const up = rankScore(link.tier, link.division) >= beforeScore;
+      logLine(
+        link.gid,
+        `${up ? "📈" : "📉"} ${emojiText(rank)} **${displayName(member)}** ${up ? "climbed" : "fell"}: **${beforeLabel}** → **${rankLabel(link)}** (${solo.leaguePoints} LP)`,
+      );
+    } else {
+      const up = solo.leaguePoints > (beforeLp ?? 0);
+      logLine(
+        link.gid,
+        `${up ? "📈" : "📉"} ${emojiText(rank)} **${displayName(member)}** ${rankLabel(link)}: ${beforeLp ?? "?"} → ${solo.leaguePoints} LP`,
+      );
+    }
   } catch (e) {
     log(`refresh ${uid} (${why}) failed: ${e.message}`);
   } finally {
