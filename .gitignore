@@ -2,4 +2,5 @@
 *.log
 .bot.lock
 .verify-pending.json
+.links.json
 node_modules/

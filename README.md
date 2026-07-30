@@ -48,5 +48,15 @@ the icon can be switched back immediately after.
   hand above the bot's role, the picker replies with the exact drag-to-fix hint.
 - **Every role change carries `X-Audit-Log-Reason`** — attributable in the
   server's audit log, plus a human-readable line in `#bot-logging`.
+- **Ranks stay current on their own** — a successful `/verify` stores a link
+  (`.links.json`, flat file — no database at this scale) and from then on: the
+  **presence layer** (privileged Presence Intent, portal toggle) notices a
+  linked member's League session ending and refreshes them ~2.5 min later —
+  near-realtime, zero API waste on people not playing; an **hourly sweep**
+  catches anything presence missed (bot downtime, invisible mode). Tier changes
+  swap the role; tier/division moves post 📈/📉 climb/fall lines to
+  `#bot-logging`; LP-only drift updates silently. There is deliberately no
+  `/update` command — the automation makes it redundant. Riot has no push API;
+  "realtime" is well-aimed polling.
 - `scripts/whoami.mjs` — token + guild sanity check. `register.mjs` — manual
   command re-registration (recovery only; normally automatic).

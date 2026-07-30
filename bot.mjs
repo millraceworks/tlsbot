@@ -401,9 +401,23 @@ async function finishVerification(uid, challenge, editToken) {
       log(`verify edit failed (non-fatal): ${e.message}`),
     );
   const solo = await soloEntry({ puuid, platform });
+  // Ownership proven — remember the link (ranked or not) so the presence layer
+  // and the sweep keep this member's role current from here on.
+  links[uid] = {
+    gid,
+    puuid,
+    riotId,
+    platform,
+    tier: solo?.tier || null,
+    division: solo?.rank || null,
+    lp: solo?.leaguePoints ?? null,
+    verifiedAt: Date.now(),
+    updatedAt: Date.now(),
+  };
+  saveLinks();
   if (!solo)
     return edit({
-      content: `✅ Ownership of **${riotId}** verified — but no ranked solo/duo entry this season, so there's no rank role to apply. Play placements and re-run \`/verify\`.`,
+      content: `✅ Ownership of **${riotId}** verified — no ranked solo/duo entry this season yet, so no rank role for now. You're linked though: once you play placements, your role will appear on its own.`,
       embeds: [],
       components: [],
     });
@@ -526,6 +540,125 @@ async function handleVerifyCheck(d) {
   }
 }
 
+// --- verified links + the "realtime" refresh engine ------------------------------
+// uid -> { gid, puuid, riotId, platform, tier, division, lp, verifiedAt, updatedAt }
+// Flat JSON file, like the challenge store — at this scale a database is pure
+// ceremony, and the file moves with the folder to any host with a disk.
+const LINKS_FILE = join(ROOT, ".links.json");
+let links = {};
+try {
+  links = JSON.parse(readFileSync(LINKS_FILE, "utf8"));
+} catch {
+  /* no links yet */
+}
+function saveLinks() {
+  try {
+    writeFileSync(LINKS_FILE, JSON.stringify(links, null, 2));
+  } catch {
+    /* best-effort */
+  }
+}
+
+const rankScore = (tier, division) => {
+  const ti = RANKS.findIndex(
+    (r) => r.name.toUpperCase() === String(tier || "").toUpperCase(),
+  );
+  if (ti < 0) return -100; // unranked sorts below Iron IV
+  return ti * 4 + (3 - ["I", "II", "III", "IV"].indexOf(division || "I"));
+};
+function rankLabel(link) {
+  if (!link.tier) return "Unranked";
+  const name =
+    RANK_BY_KEY.get(String(link.tier).toLowerCase())?.name || link.tier;
+  const div = ["MASTER", "GRANDMASTER", "CHALLENGER"].includes(link.tier)
+    ? ""
+    : ` ${link.division}`;
+  return `${name}${div}`;
+}
+
+// Re-pull one linked account. Tier change -> role swap; any tier/division
+// movement -> a climb/fall line in #bot-logging. LP-only drift stores silently.
+const refreshing = new Set();
+async function refreshLink(uid, why) {
+  const link = links[uid];
+  if (!link || refreshing.has(uid)) return;
+  refreshing.add(uid);
+  try {
+    const solo = await soloEntry({
+      puuid: link.puuid,
+      platform: link.platform,
+    });
+    if (!solo) return; // decayed/reset to unranked — keep the last role for now
+    const changedTier = solo.tier !== link.tier;
+    const changedDiv = changedTier || solo.rank !== link.division;
+    const beforeLabel = rankLabel(link);
+    const beforeScore = rankScore(link.tier, link.division);
+    link.tier = solo.tier;
+    link.division = solo.rank;
+    link.lp = solo.leaguePoints;
+    link.updatedAt = Date.now();
+    saveLinks();
+    if (!changedDiv) return;
+    const rank = RANK_BY_KEY.get(String(solo.tier).toLowerCase());
+    if (!rank) return;
+    const member = await rest("GET", `/guilds/${link.gid}/members/${uid}`);
+    if (changedTier)
+      await swapToRank(
+        link.gid,
+        member,
+        rank.key,
+        `rank auto-refresh (${why})`,
+      );
+    const up = rankScore(link.tier, link.division) >= beforeScore;
+    logLine(
+      link.gid,
+      `${up ? "📈" : "📉"} ${emojiText(rank)} **${displayName(member)}** ${up ? "climbed" : "fell"}: **${beforeLabel}** → **${rankLabel(link)}** (${solo.leaguePoints} LP)`,
+    );
+  } catch (e) {
+    log(`refresh ${uid} (${why}) failed: ${e.message}`);
+  } finally {
+    refreshing.delete(uid);
+  }
+}
+
+// Presence layer: ranks only change when a game ends, so with the (privileged,
+// portal-toggled) Presence Intent we refresh a member ~2.5 min after their
+// League session ends — "realtime" without wasting a single API call on
+// people who aren't playing.
+const inGame = new Set();
+const REFRESH_DELAY_MS = 2.5 * 60 * 1000;
+
+const playingLeague = (presence) =>
+  (presence.activities || []).some(
+    (a) => a.type === 0 && /league of legends/i.test(a.name || ""),
+  );
+
+function onPresence(d) {
+  const uid = d.user?.id;
+  if (!uid || !links[uid]) return;
+  if (playingLeague(d)) {
+    inGame.add(uid);
+    return;
+  }
+  if (!inGame.has(uid)) return;
+  inGame.delete(uid);
+  log(`presence: linked member ${uid} finished a League session`);
+  setTimeout(() => refreshLink(uid, "game ended"), REFRESH_DELAY_MS);
+}
+
+// Hourly safety net: catches ranks that changed while the bot was down or the
+// member played invisible/offline. Sequential with spacing — rate-limit kind.
+async function sweepLinks() {
+  const ids = Object.keys(links);
+  if (ids.length) log(`sweep: refreshing ${ids.length} linked account(s)`);
+  for (const uid of ids) {
+    await refreshLink(uid, "hourly sweep");
+    await new Promise((r) => setTimeout(r, 1500));
+  }
+}
+setInterval(sweepLinks, 60 * 60 * 1000);
+setTimeout(sweepLinks, 60 * 1000); // one pass shortly after startup
+
 async function handleSetup(d) {
   // 10 sequential role creates can outrun the 3s callback window — defer first.
   await respond(d, { type: 5, data: { flags: 64 } });
@@ -621,7 +754,11 @@ async function onInteraction(d) {
 
 // --- gateway --------------------------------------------------------------------
 const GATEWAY = "wss://gateway.discord.gg/?v=10&encoding=json";
-const INTENTS = 1; // GUILDS only — no privileged intents, interactions aren't gated
+// GUILDS + GUILD_PRESENCES. Presences are privileged: if the portal toggle is
+// off, Discord refuses the whole connection (4014) — we then drop the bit and
+// reconnect, so the bot never dies over it (presence refresh off, sweep still on).
+const INTENTS = 1 | (1 << 8);
+let intents = INTENTS;
 
 let ws = null;
 let heartbeatTimer = null;
@@ -654,7 +791,7 @@ function startHeartbeat(intervalMs) {
 function identify() {
   send(2, {
     token: creds().token,
-    intents: INTENTS,
+    intents,
     properties: { os: "windows", browser: "tlsbot", device: "tlsbot" },
     presence: { status: "online", afk: false, activities: [] },
   });
@@ -711,9 +848,17 @@ function connect() {
       log(`guild available: ${d.name} (${d.id})`);
       guildFeatures.set(d.id, new Set(d.features || []));
       cacheLogChannel(d);
+      // Seed who's mid-game right now, so a session that ends after startup
+      // still triggers a refresh.
+      for (const p of d.presences || [])
+        if (links[p.user?.id] && playingLeague(p)) inGame.add(p.user.id);
       registerCommands(d.id).catch((e) =>
         log(`command registration failed for ${d.id}: ${e.message}`),
       );
+      return;
+    }
+    if (t === "PRESENCE_UPDATE") {
+      onPresence(d);
       return;
     }
     if (t === "INTERACTION_CREATE") {
@@ -727,6 +872,16 @@ function connect() {
     if (ev.code === 4004) {
       log("auth failed (4004): bad DISCORD_BOT_TOKEN — exiting");
       process.exit(9);
+    }
+    if (ev.code === 4014 && intents & (1 << 8)) {
+      intents &= ~(1 << 8);
+      log(
+        "disallowed intents (4014): Presence Intent not enabled in the Dev Portal — " +
+          "presence-triggered refresh OFF (hourly sweep still on). Enable it under " +
+          "Bot -> Privileged Gateway Intents, then restart to turn it on.",
+      );
+      setTimeout(connect, 1000);
+      return;
     }
     reconnects++;
     const backoff = Math.min(5000 * reconnects, 30000);
