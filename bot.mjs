@@ -666,6 +666,25 @@ function onPresence(d) {
 // happen to share activity — this loop needs nothing from anyone's settings.
 const SPECTATE_INTERVAL_MS = 2 * 60 * 1000;
 const inLiveGame = new Set();
+
+// Live feed: also announce game start/end in #bot-logging (Noah 2026-07-30:
+// "I want all of that in bot logging — I'll turn it off later if it makes
+// sense"). Flip to false to quiet the feed without touching the detector.
+const LIVE_FEED = true;
+const QUEUE_NAMES = {
+  420: "Ranked Solo/Duo",
+  440: "Ranked Flex",
+  400: "Normal Draft",
+  430: "Normal Blind",
+  450: "ARAM",
+  490: "Quickplay",
+  1700: "Arena",
+};
+const queueLabel = (game) => {
+  const q = QUEUE_NAMES[game?.gameQueueConfigId];
+  return q ? ` (${q})` : "";
+};
+
 async function pollLiveGames() {
   for (const [uid, link] of Object.entries(links)) {
     try {
@@ -677,10 +696,20 @@ async function pollLiveGames() {
         if (!inLiveGame.has(uid)) {
           inLiveGame.add(uid);
           log(`spectator: ${link.riotId} is in a live game`);
+          if (LIVE_FEED)
+            logLine(
+              link.gid,
+              `🎮 **${link.riotId}** is in a live game${queueLabel(game)}`,
+            );
         }
       } else if (inLiveGame.has(uid)) {
         inLiveGame.delete(uid);
         log(`spectator: ${link.riotId} finished a game — refresh in 90s`);
+        if (LIVE_FEED)
+          logLine(
+            link.gid,
+            `🏁 **${link.riotId}** finished their game — rank check in ~90s`,
+          );
         setTimeout(() => refreshLink(uid, "game ended"), 90_000);
       }
     } catch (e) {
