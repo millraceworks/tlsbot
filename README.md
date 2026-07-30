@@ -61,5 +61,10 @@ the icon can be switched back immediately after.
   changes post 📈/📉 lines to `#bot-logging` (currently verbose incl. LP-only,
   for testing). No `/update` command — the automation makes it redundant. Riot
   has no push API; "realtime" is well-aimed polling.
+- **🎉 Promotion celebrations** — a tier promotion posts a congratulations
+  (with @mention) to `CELEBRATE_CHANNEL_ID` (default: the log channel), **once
+  per tier per split**: demote-then-repromote stays quiet (Goonmaster's spec).
+  Dedup state lives on the member's link under `SPLIT_KEY`; bump the key in
+  `.env` at each new ranked split to reset the slate.
 - `scripts/whoami.mjs` — token + guild sanity check. `register.mjs` — manual
   command re-registration (recovery only; normally automatic).

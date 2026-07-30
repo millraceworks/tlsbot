@@ -36,7 +36,7 @@ import {
   profileIconUrl,
 } from "./lib/riot.mjs";
 
-const { appId, logChannelId } = creds();
+const { appId, logChannelId, celebrateChannelId, splitKey } = creds();
 
 const log = (m) =>
   process.stderr.write(`[tlsbot ${new Date().toISOString()}] ${m}\n`);
@@ -143,6 +143,15 @@ function logLine(guildId, content) {
   if (!ch) return;
   rest("POST", `/channels/${ch}/messages`, { body: { content } }).catch((e) =>
     log(`log-line failed (non-fatal): ${e.message}`),
+  );
+}
+
+// 🎉 promotion celebrations: CELEBRATE_CHANNEL_ID if set, else the log channel.
+function celebrate(guildId, content) {
+  const ch = celebrateChannelId || logChannels.get(guildId);
+  if (!ch) return;
+  rest("POST", `/channels/${ch}/messages`, { body: { content } }).catch((e) =>
+    log(`celebrate post failed (non-fatal): ${e.message}`),
   );
 }
 
@@ -595,6 +604,7 @@ async function refreshLink(uid, why) {
     const changedTier = solo.tier !== link.tier;
     const changedDiv = changedTier || solo.rank !== link.division;
     const changedLp = solo.leaguePoints !== link.lp;
+    const beforeTier = link.tier;
     const beforeLabel = rankLabel(link);
     const beforeScore = rankScore(link.tier, link.division);
     const beforeLp = link.lp;
@@ -620,6 +630,27 @@ async function refreshLink(uid, why) {
         link.gid,
         `${up ? "📈" : "📉"} ${emojiText(rank)} **${displayName(member)}** ${up ? "climbed" : "fell"}: **${beforeLabel}** → **${rankLabel(link)}** (${solo.leaguePoints} LP)`,
       );
+      // Celebration (Goonmaster spec 2026-07-30): a TIER promotion gets a 🎉,
+      // once per tier per split — demote-then-repromote stays quiet. The dedup
+      // record lives on the link itself, keyed by splitKey; bumping SPLIT_KEY
+      // in .env at a new split wipes the slate. Unranked -> placed counts: your
+      // first rank of the split is by definition a first time this split.
+      const ti = (t) =>
+        RANKS.findIndex(
+          (r) => r.name.toUpperCase() === String(t || "").toUpperCase(),
+        );
+      if (changedTier && ti(link.tier) > ti(beforeTier)) {
+        link.celebrated ??= {};
+        const done = (link.celebrated[splitKey] ??= []);
+        if (!done.includes(link.tier)) {
+          done.push(link.tier);
+          saveLinks();
+          celebrate(
+            link.gid,
+            `🎉 ${emojiText(rank)} <@${uid}> just hit **${rank.name}** for the first time this split — GGs! 🏆 (${link.riotId})`,
+          );
+        }
+      }
     } else {
       const up = solo.leaguePoints > (beforeLp ?? 0);
       logLine(
