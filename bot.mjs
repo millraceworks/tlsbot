@@ -434,7 +434,16 @@ async function finishVerification(uid, challenge, editToken) {
     tier: solo?.tier || null,
     division: solo?.rank || null,
     lp: solo?.leaguePoints ?? null,
-    flex: fx ? { tier: fx.tier, division: fx.rank, lp: fx.leaguePoints } : {},
+    // Explicit nulls (not a bare {}): "tier" being PRESENT-but-null means
+    // "verified while unranked" — a later placement is a real transition and
+    // celebrates. A state object MISSING the key entirely means "queue never
+    // seeded" and gets adopted silently (see processQueueEntry).
+    flex: fx
+      ? { tier: fx.tier, division: fx.rank, lp: fx.leaguePoints }
+      : { tier: null, division: null, lp: null },
+    // Re-verifying must NOT wipe celebration history, or demote -> re-verify
+    // -> re-promote would farm duplicate 🎉s (the exact thing the spec bans).
+    celebrated: links[uid]?.celebrated ?? {},
     verifiedAt: Date.now(),
     updatedAt: Date.now(),
   };
@@ -680,6 +689,16 @@ async function processQueueEntry({
   label,
   manageRoles,
 }) {
+  // First observation of this queue for a link that predates its tracking
+  // (the "tier" key is absent entirely, vs present-but-null = truly unranked
+  // at verify): adopt the current rank SILENTLY — no log line, no 🎉. This is
+  // what made the flex-rollout artifact a one-off instead of a rollout wave.
+  if (!("tier" in state)) {
+    state.tier = entry.tier;
+    state.division = entry.rank;
+    state.lp = entry.leaguePoints;
+    return;
+  }
   const changedTier = entry.tier !== state.tier;
   const changedDiv = changedTier || entry.rank !== state.division;
   const changedLp = entry.leaguePoints !== state.lp;
