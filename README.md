@@ -8,11 +8,15 @@ roles, swaps the old rank out, and logs every change to `#bot-logging`.
 
 | Command      | Who  | What                                                                 |
 | ------------ | ---- | -------------------------------------------------------------------- |
+| `/verify`    | all  | Verify your REAL solo/duo rank via Riot ID (`Name#TAG` + region)     |
 | `/ranksetup` | mods | Create any missing rank roles — colored, zero permissions, unhoisted |
-| `/rankpanel` | mods | Post the persistent picker panel (pin it) — the member interface     |
+| `/rankpanel` | mods | Post the persistent picker panel (pin it) — self-report fallback     |
 
-There is deliberately no `/rank` command (owner preference): the panel is the one
-way members pick a rank (Iron → Challenger, plus "Clear my rank").
+There is deliberately no `/rank` command (owner preference): the panel covers
+self-reported picks (Iron → Challenger, plus "Clear my rank"), and `/verify` is
+the flagship — the rank comes from the Riot API (`RIOT_API_KEY` in `.env`,
+re-read on every call so rotating the 24h dev key needs no restart), not from
+the member's imagination.
 
 ## Setup
 

@@ -5,9 +5,11 @@
 // answered via REST callbacks. Commands are (re-)registered idempotently per guild on
 // every GUILD_CREATE, so inviting the bot to a server is the ONLY setup step.
 //
+//   /verify     all  — Riot-ID rank verification: pulls the REAL solo/duo rank
+//                      from the Riot API and applies the crest role
 //   /ranksetup  mods — create any missing rank roles (colored, zero permissions)
-//   /rankpanel  mods — post the persistent picker panel (the ONLY member
-//                      interface; there is deliberately no /rank command)
+//   /rankpanel  mods — post the persistent picker panel (self-report fallback;
+//                      there is deliberately no /rank command)
 //
 // The picker shows Riot's official rank crests via APPLICATION-owned emojis
 // (uploaded once by scripts/upload-emojis.mjs). When a guild has the boost-gated
@@ -26,6 +28,7 @@ import {
   rolePayload,
 } from "./lib/ranks.mjs";
 import { COMMANDS } from "./lib/commands.mjs";
+import { lookupSoloRank } from "./lib/riot.mjs";
 
 const { appId, logChannelId } = creds();
 
@@ -149,15 +152,20 @@ const editOriginal = (d, data) =>
     body: data,
   });
 
-// Ephemeral error to the user: try the callback; if we already responded, fall
-// back to a followup so the user is never left with "interaction failed".
+// Ephemeral error to the user: try the callback; if we already acked (e.g. a
+// deferred reply), edit the original so no "thinking…" spinner is left hanging;
+// last resort, post a followup — the user is never left with "interaction failed".
 async function errorReply(d, content) {
   try {
     await respond(d, { type: 4, data: { flags: 64, content } });
   } catch {
-    await rest("POST", `/webhooks/${appId}/${d.token}`, {
-      body: { flags: 64, content },
-    }).catch((e) => log(`error-reply failed: ${e.message}`));
+    try {
+      await editOriginal(d, { content });
+    } catch {
+      await rest("POST", `/webhooks/${appId}/${d.token}`, {
+        body: { flags: 64, content },
+      }).catch((e) => log(`error-reply failed: ${e.message}`));
+    }
   }
 }
 
@@ -180,6 +188,35 @@ const selectRow = () => ({
   ],
 });
 
+// --- rank-role core (shared by the panel picker and /verify) --------------------
+// Swap the member onto the target rank role: remove every other rank role they
+// hold, add the target (auto-creating it if a mod deleted it), return what was.
+async function swapToRank(gid, member, rankKey, reason) {
+  const uid = member.user.id;
+  const rank = RANK_BY_KEY.get(rankKey);
+  if (!rank) throw new Error(`unknown rank value: ${rankKey}`);
+  const roles = await rest("GET", `/guilds/${gid}/roles`);
+  const rankRoles = roles.filter((r) => RANK_NAME_SET.has(r.name));
+  const have = new Set(member.roles);
+  const current = rankRoles.filter((r) => have.has(r.id));
+  let target = rankRoles.find((r) => r.name === rank.name);
+  if (!target)
+    target = await rest("POST", `/guilds/${gid}/roles`, {
+      body: rolePayload(rank),
+      reason: "rank role auto-created",
+    });
+  for (const r of current)
+    if (r.id !== target.id)
+      await rest("DELETE", `/guilds/${gid}/members/${uid}/roles/${r.id}`, {
+        reason,
+      });
+  if (!have.has(target.id))
+    await rest("PUT", `/guilds/${gid}/members/${uid}/roles/${target.id}`, {
+      reason,
+    });
+  return { rank, was: current.map((r) => r.name) };
+}
+
 // --- handlers -------------------------------------------------------------------
 async function handlePick(d) {
   const gid = d.guild_id;
@@ -187,38 +224,30 @@ async function handlePick(d) {
   const uid = member.user.id;
   const value = d.data.values?.[0];
 
-  const roles = await rest("GET", `/guilds/${gid}/roles`);
-  const rankRoles = roles.filter((r) => RANK_NAME_SET.has(r.name));
-  const have = new Set(member.roles);
-  const current = rankRoles.filter((r) => have.has(r.id));
-
   let confirmation;
+  let wasNames = [];
   if (value === "clear") {
+    const roles = await rest("GET", `/guilds/${gid}/roles`);
+    const have = new Set(member.roles);
+    const current = roles.filter(
+      (r) => RANK_NAME_SET.has(r.name) && have.has(r.id),
+    );
     for (const r of current)
       await rest("DELETE", `/guilds/${gid}/members/${uid}/roles/${r.id}`, {
-        reason: "rank cleared via /rank",
+        reason: "rank cleared via panel",
       });
+    wasNames = current.map((r) => r.name);
     confirmation = current.length
       ? "🧹 Rank cleared."
       : "You had no rank role to clear.";
   } else {
-    const rank = RANK_BY_KEY.get(value);
-    if (!rank) throw new Error(`unknown rank value: ${value}`);
-    let target = rankRoles.find((r) => r.name === rank.name);
-    if (!target)
-      target = await rest("POST", `/guilds/${gid}/roles`, {
-        body: rolePayload(rank),
-        reason: "rank role auto-created by /rank",
-      });
-    for (const r of current)
-      if (r.id !== target.id)
-        await rest("DELETE", `/guilds/${gid}/members/${uid}/roles/${r.id}`, {
-          reason: "rank swap via /rank",
-        });
-    if (!have.has(target.id))
-      await rest("PUT", `/guilds/${gid}/members/${uid}/roles/${target.id}`, {
-        reason: "rank set via /rank",
-      });
+    const { rank, was } = await swapToRank(
+      gid,
+      member,
+      value,
+      "rank picked via panel",
+    );
+    wasNames = was;
     confirmation = `${emojiText(rank)} You're now **${rank.name}**.`;
   }
 
@@ -232,7 +261,7 @@ async function handlePick(d) {
       : { type: 4, data: { flags: 64, content: confirmation } },
   );
 
-  const was = current.map((r) => r.name).join(", ");
+  const was = wasNames.join(", ");
   logLine(
     gid,
     value === "clear"
@@ -241,6 +270,76 @@ async function handlePick(d) {
           was && was !== RANK_BY_KEY.get(value).name ? ` (was ${was})` : ""
         }`,
   );
+}
+
+// /verify riot_id:<Name#TAG> [region] — the flagship: pull the REAL solo/duo
+// rank from the Riot API and apply the crest role. Self-reported rank is junk
+// data; this is the thing native onboarding and off-the-shelf bots don't do.
+async function handleVerify(d) {
+  // Riot round-trips can outrun the 3s callback window — defer immediately.
+  await respond(d, { type: 5, data: { flags: 64 } });
+  const gid = d.guild_id;
+  const opts = Object.fromEntries(
+    (d.data.options || []).map((o) => [o.name, o.value]),
+  );
+  const platform = opts.region || "na1";
+  const raw = String(opts.riot_id || "").trim();
+  const hash = raw.indexOf("#");
+  if (hash < 1 || hash === raw.length - 1)
+    return editOriginal(d, {
+      content:
+        "⚠️ That doesn't look like a Riot ID — use the full `Name#TAG` form (e.g. `Faker#KR1`).",
+    });
+  const gameName = raw.slice(0, hash).trim();
+  const tagLine = raw.slice(hash + 1).trim();
+
+  try {
+    const { account, solo } = await lookupSoloRank({
+      gameName,
+      tagLine,
+      platform,
+    });
+    const riotId = `${account.gameName}#${account.tagLine}`;
+    if (!solo)
+      return editOriginal(d, {
+        content: `Found **${riotId}**, but no ranked solo/duo entry this season — no rank role to apply. Play placements and re-run \`/verify\`.`,
+      });
+    const rankKey = String(solo.tier || "").toLowerCase();
+    if (!RANK_BY_KEY.has(rankKey))
+      return editOriginal(d, {
+        content: `⚠️ Riot returned an unexpected tier ("${solo.tier}") — tell a mod.`,
+      });
+    const { rank, was } = await swapToRank(
+      gid,
+      d.member,
+      rankKey,
+      `rank verified via Riot API (${riotId}, ${platform})`,
+    );
+    const division = ["MASTER", "GRANDMASTER", "CHALLENGER"].includes(solo.tier)
+      ? ""
+      : ` ${solo.rank}`;
+    const label = `${rank.name}${division} · ${solo.leaguePoints} LP`;
+    await editOriginal(d, {
+      content: `${emojiText(rank)} Verified: **${riotId}** is **${label}** — role applied.`,
+    });
+    logLine(
+      gid,
+      `✅ ${emojiText(rank)} **${displayName(d.member)}** verified as **${riotId}** — ${label}${
+        was.length && was[0] !== rank.name ? ` (was ${was.join(", ")})` : ""
+      }`,
+    );
+  } catch (e) {
+    if (e.riot === "nokey" || e.status === 401 || e.status === 403)
+      return editOriginal(d, {
+        content:
+          "⚠️ The Riot API key is missing or expired — a mod needs to refresh it (dev keys last 24h).",
+      });
+    if (e.status === 404)
+      return editOriginal(d, {
+        content: `⚠️ Couldn't find **${gameName}#${tagLine}** — check the spelling and tag, and the region (this looked in ${platform.toUpperCase()}).`,
+      });
+    throw e; // anything else -> onInteraction's catch (errorReply edits the deferred msg)
+  }
 }
 
 async function handleSetup(d) {
@@ -316,6 +415,7 @@ async function handlePanel(d) {
 async function onInteraction(d) {
   try {
     if (d.type === 2) {
+      if (d.data.name === "verify") return await handleVerify(d);
       if (d.data.name === "ranksetup") return await handleSetup(d);
       if (d.data.name === "rankpanel") return await handlePanel(d);
       return;
