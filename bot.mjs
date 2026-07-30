@@ -31,7 +31,7 @@ import { COMMANDS } from "./lib/commands.mjs";
 import {
   lookupAccount,
   getSummoner,
-  soloEntry,
+  rankedEntries,
   activeGame,
   challengerLadderSize,
   profileIconUrl,
@@ -42,6 +42,7 @@ const {
   logChannelId,
   celebrateChannelId,
   splitKey: envSplitKey,
+  flexRoles,
 } = creds();
 
 const log = (m) =>
@@ -209,21 +210,25 @@ const selectRow = () => ({
   ],
 });
 
-// --- rank-role core (shared by the panel picker and /verify) --------------------
-// Swap the member onto the target rank role: remove every other rank role they
-// hold, add the target (auto-creating it if a mod deleted it), return what was.
-async function swapToRank(gid, member, rankKey, reason) {
+// --- rank-role core (shared by the panel picker, /verify, and the refresher) ----
+// Swap the member onto the target rank role: remove every other rank role of
+// the SAME variant they hold, add the target (auto-creating it if missing),
+// return what was. variant "flex" uses a parallel "<Tier> (Flex)" role ladder,
+// so solo and flex roles never displace each other.
+async function swapToRank(gid, member, rankKey, reason, variant = "solo") {
   const uid = member.user.id;
   const rank = RANK_BY_KEY.get(rankKey);
   if (!rank) throw new Error(`unknown rank value: ${rankKey}`);
+  const nameFor = (r) => (variant === "flex" ? `${r.name} (Flex)` : r.name);
+  const variantNames = new Set(RANKS.map(nameFor));
   const roles = await rest("GET", `/guilds/${gid}/roles`);
-  const rankRoles = roles.filter((r) => RANK_NAME_SET.has(r.name));
+  const rankRoles = roles.filter((r) => variantNames.has(r.name));
   const have = new Set(member.roles);
   const current = rankRoles.filter((r) => have.has(r.id));
-  let target = rankRoles.find((r) => r.name === rank.name);
+  let target = rankRoles.find((r) => r.name === nameFor(rank));
   if (!target)
     target = await rest("POST", `/guilds/${gid}/roles`, {
-      body: rolePayload(rank),
+      body: { ...rolePayload(rank), name: nameFor(rank) },
       reason: "rank role auto-created",
     });
   for (const r of current)
@@ -416,9 +421,11 @@ async function finishVerification(uid, challenge, editToken) {
     editByToken(editToken, data).catch((e) =>
       log(`verify edit failed (non-fatal): ${e.message}`),
     );
-  const solo = await soloEntry({ puuid, platform });
-  // Ownership proven — remember the link (ranked or not) so the presence layer
-  // and the sweep keep this member's role current from here on.
+  const entries = await rankedEntries({ puuid, platform });
+  const solo = entries.find((e) => e.queueType === "RANKED_SOLO_5x5") || null;
+  const fx = entries.find((e) => e.queueType === "RANKED_FLEX_SR") || null;
+  // Ownership proven — remember the link (ranked or not) so the refresher
+  // keeps this member's roles current from here on. Both queues tracked.
   links[uid] = {
     gid,
     puuid,
@@ -427,13 +434,25 @@ async function finishVerification(uid, challenge, editToken) {
     tier: solo?.tier || null,
     division: solo?.rank || null,
     lp: solo?.leaguePoints ?? null,
+    flex: fx ? { tier: fx.tier, division: fx.rank, lp: fx.leaguePoints } : {},
     verifiedAt: Date.now(),
     updatedAt: Date.now(),
   };
   saveLinks();
+  if (fx && flexRoles) {
+    const fxKey = String(fx.tier || "").toLowerCase();
+    if (RANK_BY_KEY.has(fxKey))
+      await swapToRank(
+        gid,
+        await rest("GET", `/guilds/${gid}/members/${uid}`),
+        fxKey,
+        `flex rank verified via Riot icon handshake (${riotId}, ${platform})`,
+        "flex",
+      ).catch((e) => log(`flex role on verify failed: ${e.message}`));
+  }
   if (!solo)
     return edit({
-      content: `✅ Ownership of **${riotId}** verified — no ranked solo/duo entry this season yet, so no rank role for now. You're linked though: once you play placements, your role will appear on its own.`,
+      content: `✅ Ownership of **${riotId}** verified — no ranked solo/duo entry this season yet, so no solo/duo rank role for now. You're linked though: once you play placements, your role will appear on its own.${fx ? ` (Flex noted: ${rankLabel({ tier: fx.tier, division: fx.rank })}.)` : ""}`,
       embeds: [],
       components: [],
     });
@@ -640,78 +659,126 @@ function rankLabel(link) {
   return `${name}${div}`;
 }
 
-// Re-pull one linked account. Tier change -> role swap; any tier/division
-// movement -> a climb/fall line in #bot-logging. LP-only changes log too for
-// now (Noah 2026-07-30: verbose while testing; quiet them for a big server by
-// restoring the `if (!changedDiv) return` early-out).
+const tierIndexOf = (t) =>
+  RANKS.findIndex(
+    (r) => r.name.toUpperCase() === String(t || "").toUpperCase(),
+  );
+
+// Process one queue's entry for a link: mutate the queue state, swap the role
+// (when this queue manages roles), log the change, and celebrate first-time
+// tier promotions (Goonmaster spec: once per tier per split, per queue;
+// demote-then-repromote stays quiet; unranked -> placed counts as a first).
+// LP-only changes log too for now (Noah 2026-07-30: verbose while testing).
+async function processQueueEntry({
+  uid,
+  link,
+  entry,
+  state,
+  getMember,
+  why,
+  variant,
+  label,
+  manageRoles,
+}) {
+  const changedTier = entry.tier !== state.tier;
+  const changedDiv = changedTier || entry.rank !== state.division;
+  const changedLp = entry.leaguePoints !== state.lp;
+  const beforeTier = state.tier;
+  const beforeLabel = rankLabel(state);
+  const beforeScore = rankScore(state.tier, state.division);
+  const beforeLp = state.lp;
+  state.tier = entry.tier;
+  state.division = entry.rank;
+  state.lp = entry.leaguePoints;
+  if (!changedDiv && !changedLp) return;
+  const rank = RANK_BY_KEY.get(String(entry.tier).toLowerCase());
+  if (!rank) return;
+  const member = await getMember();
+  if (changedTier && manageRoles)
+    await swapToRank(
+      link.gid,
+      member,
+      rank.key,
+      `rank auto-refresh${label} (${why})`,
+      variant,
+    );
+  if (changedDiv) {
+    const up = rankScore(state.tier, state.division) >= beforeScore;
+    logLine(
+      link.gid,
+      `${up ? "📈" : "📉"} ${emojiText(rank)} **${displayName(member)}** ${up ? "climbed" : "fell"}${label}: **${beforeLabel}** → **${rankLabel(state)}** (${entry.leaguePoints} LP)`,
+    );
+    if (changedTier && tierIndexOf(state.tier) > tierIndexOf(beforeTier)) {
+      link.celebrated ??= {};
+      const done = (link.celebrated[currentSplit()] ??= []);
+      const dedupKey = variant === "flex" ? `${state.tier}-flex` : state.tier;
+      if (!done.includes(dedupKey)) {
+        done.push(dedupKey);
+        celebrate(
+          link.gid,
+          `🎉 ${emojiText(rank)} <@${uid}> just hit **${rank.name}**${variant === "flex" ? " in **Flex**" : ""} for the first time this split — GGs! 🏆 (${link.riotId})`,
+        );
+      }
+    }
+  } else {
+    const up = entry.leaguePoints > (beforeLp ?? 0);
+    logLine(
+      link.gid,
+      `${up ? "📈" : "📉"} ${emojiText(rank)} **${displayName(member)}** ${rankLabel(state)}${label}: ${beforeLp ?? "?"} → ${entry.leaguePoints} LP`,
+    );
+  }
+}
+
+// Re-pull one linked account — ONE Riot call covers both queues. Solo/duo
+// state lives on the link root (back-compat) and always manages roles; flex
+// lives under link.flex, always tracked/logged/celebrated, roles only behind
+// the FLEX_ROLES flag (a parallel "<Tier> (Flex)" ladder).
 const refreshing = new Set();
 async function refreshLink(uid, why) {
   const link = links[uid];
   if (!link || refreshing.has(uid)) return;
   refreshing.add(uid);
   try {
-    const solo = await soloEntry({
+    const entries = await rankedEntries({
       puuid: link.puuid,
       platform: link.platform,
     });
-    if (!solo) return; // decayed/reset to unranked — keep the last role for now
-    const changedTier = solo.tier !== link.tier;
-    const changedDiv = changedTier || solo.rank !== link.division;
-    const changedLp = solo.leaguePoints !== link.lp;
-    const beforeTier = link.tier;
-    const beforeLabel = rankLabel(link);
-    const beforeScore = rankScore(link.tier, link.division);
-    const beforeLp = link.lp;
-    link.tier = solo.tier;
-    link.division = solo.rank;
-    link.lp = solo.leaguePoints;
+    let member = null; // fetched at most once, and only when something changed
+    const getMember = async () =>
+      (member ??= await rest("GET", `/guilds/${link.gid}/members/${uid}`));
+
+    const solo = entries.find((e) => e.queueType === "RANKED_SOLO_5x5");
+    if (solo)
+      await processQueueEntry({
+        uid,
+        link,
+        entry: solo,
+        state: link,
+        getMember,
+        why,
+        variant: "solo",
+        label: "",
+        manageRoles: true,
+      });
+
+    const fx = entries.find((e) => e.queueType === "RANKED_FLEX_SR");
+    if (fx) {
+      link.flex ??= {};
+      await processQueueEntry({
+        uid,
+        link,
+        entry: fx,
+        state: link.flex,
+        getMember,
+        why,
+        variant: "flex",
+        label: " (Flex)",
+        manageRoles: flexRoles,
+      });
+    }
+
     link.updatedAt = Date.now();
     saveLinks();
-    if (!changedDiv && !changedLp) return;
-    const rank = RANK_BY_KEY.get(String(solo.tier).toLowerCase());
-    if (!rank) return;
-    const member = await rest("GET", `/guilds/${link.gid}/members/${uid}`);
-    if (changedTier)
-      await swapToRank(
-        link.gid,
-        member,
-        rank.key,
-        `rank auto-refresh (${why})`,
-      );
-    if (changedDiv) {
-      const up = rankScore(link.tier, link.division) >= beforeScore;
-      logLine(
-        link.gid,
-        `${up ? "📈" : "📉"} ${emojiText(rank)} **${displayName(member)}** ${up ? "climbed" : "fell"}: **${beforeLabel}** → **${rankLabel(link)}** (${solo.leaguePoints} LP)`,
-      );
-      // Celebration (Goonmaster spec 2026-07-30): a TIER promotion gets a 🎉,
-      // once per tier per split — demote-then-repromote stays quiet. The dedup
-      // record lives on the link itself, keyed by splitKey; bumping SPLIT_KEY
-      // in .env at a new split wipes the slate. Unranked -> placed counts: your
-      // first rank of the split is by definition a first time this split.
-      const ti = (t) =>
-        RANKS.findIndex(
-          (r) => r.name.toUpperCase() === String(t || "").toUpperCase(),
-        );
-      if (changedTier && ti(link.tier) > ti(beforeTier)) {
-        link.celebrated ??= {};
-        const done = (link.celebrated[currentSplit()] ??= []);
-        if (!done.includes(link.tier)) {
-          done.push(link.tier);
-          saveLinks();
-          celebrate(
-            link.gid,
-            `🎉 ${emojiText(rank)} <@${uid}> just hit **${rank.name}** for the first time this split — GGs! 🏆 (${link.riotId})`,
-          );
-        }
-      }
-    } else {
-      const up = solo.leaguePoints > (beforeLp ?? 0);
-      logLine(
-        link.gid,
-        `${up ? "📈" : "📉"} ${emojiText(rank)} **${displayName(member)}** ${rankLabel(link)}: ${beforeLp ?? "?"} → ${solo.leaguePoints} LP`,
-      );
-    }
   } catch (e) {
     log(`refresh ${uid} (${why}) failed: ${e.message}`);
   } finally {
