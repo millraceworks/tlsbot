@@ -330,7 +330,7 @@ async function handleVerify(d) {
     await editOriginal(d, {
       content:
         `Found **${riotId}** (${platform.toUpperCase()}). Now prove it's yours:\n` +
-        `1. In the League client, open your profile → change your **summoner icon** to the starter icon shown here (icon **#${iconId}**).\n` +
+        `1. In the **League client** (the game itself — not Discord), open your profile → change your **summoner icon** to the starter icon shown here (icon **#${iconId}**).\n` +
         `2. Come back and press **Check** — I'll confirm it via the Riot API and apply your real rank.\n` +
         `-# You can switch your icon back right after. Challenge expires in 15 minutes.`,
       embeds: [
