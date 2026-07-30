@@ -15,7 +15,7 @@
 //
 // Role changes carry X-Audit-Log-Reason, and each change is echoed to #bot-logging
 // (or LOG_CHANNEL_ID) when such a channel exists.
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { creds, ROOT } from "./lib/env.mjs";
 import { rest } from "./lib/rest.mjs";
@@ -31,6 +31,49 @@ const { appId, logChannelId } = creds();
 
 const log = (m) =>
   process.stderr.write(`[tlsbot ${new Date().toISOString()}] ${m}\n`);
+
+// --- singleton lock (one gateway connection, ever) ------------------------------
+// Two live processes would both receive INTERACTION_CREATE and double-apply role
+// changes. PID file validated by LIVENESS (kill(pid,0)), never trusted blindly,
+// so a stale lock after a crash or reboot can never wedge the bot shut.
+// Exit codes the keeper script keys off: 3 = another instance is live (stop),
+// 9 = bad token (retrying can't help; stop). Anything else = crash (restart me).
+const LOCK = join(ROOT, ".bot.lock");
+function claimLock() {
+  let holder = 0;
+  try {
+    holder = Number(JSON.parse(readFileSync(LOCK, "utf8")).pid) || 0;
+  } catch {
+    /* missing/unreadable lock counts as stale */
+  }
+  if (holder && holder !== process.pid) {
+    let alive = false;
+    try {
+      process.kill(holder, 0);
+      alive = true;
+    } catch {
+      /* dead */
+    }
+    if (alive) {
+      log(`refusing to start: TLSBot pid ${holder} is already live`);
+      process.exit(3);
+    }
+    log(`taking over stale lock from dead pid ${holder}`);
+  }
+  try {
+    writeFileSync(LOCK, JSON.stringify({ pid: process.pid }));
+  } catch {
+    /* a lock we cannot write must never block the bot — degrade, don't die */
+  }
+  process.on("exit", () => {
+    try {
+      const held = Number(JSON.parse(readFileSync(LOCK, "utf8")).pid) || 0;
+      if (held === process.pid) writeFileSync(LOCK, JSON.stringify({ pid: 0 }));
+    } catch {
+      /* best-effort */
+    }
+  });
+}
 
 // --- commands (registered per guild — instant, unlike global) -------------------
 async function registerCommands(guildId) {
@@ -397,7 +440,7 @@ function connect() {
     clearInterval(heartbeatTimer);
     if (ev.code === 4004) {
       log("auth failed (4004): bad DISCORD_BOT_TOKEN — exiting");
-      process.exit(1);
+      process.exit(9);
     }
     reconnects++;
     const backoff = Math.min(5000 * reconnects, 30000);
@@ -412,5 +455,6 @@ function connect() {
 }
 
 log("starting TLSBot");
+claimLock();
 await loadAppEmojis();
 connect();

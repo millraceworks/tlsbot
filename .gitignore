@@ -1,3 +1,4 @@
 .env
 *.log
+.bot.lock
 node_modules/
