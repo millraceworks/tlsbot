@@ -70,9 +70,11 @@ the icon can be switched back immediately after.
   rolls its split key, resets the slate, and announces it in the log channel.
   `SPLIT_KEY` in `.env` is a manual override that disables auto-detection.
 - **Flex queue** — tracked unconditionally (same API call as solo, zero extra
-  cost): flex changes log with a `(Flex)` tag and flex tier-firsts get their
-  own 🎉 (deduped separately from solo). Set `FLEX_ROLES=1` to also maintain a
-  parallel `<Tier> (Flex)` role ladder — off by default pending the owner's
-  call; solo and flex roles never displace each other.
+  cost) but **silent by default**: state stays current in `.links.json` with no
+  roles, log lines, or celebrations (owner's call, 2026-07-30: "Let's ignore
+  flex rank"). Because the data never goes stale, changing his mind later is a
+  flag flip with no backfill: `FLEX_VISIBLE=1` enables `(Flex)`-tagged logs +
+  separately-deduped 🎉s; `FLEX_ROLES=1` adds a parallel `<Tier> (Flex)` role
+  ladder that never displaces solo roles.
 - `scripts/whoami.mjs` — token + guild sanity check. `register.mjs` — manual
   command re-registration (recovery only; normally automatic).

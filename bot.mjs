@@ -42,6 +42,7 @@ const {
   logChannelId,
   celebrateChannelId,
   splitKey: envSplitKey,
+  flexVisible,
   flexRoles,
 } = creds();
 
@@ -461,7 +462,7 @@ async function finishVerification(uid, challenge, editToken) {
   }
   if (!solo)
     return edit({
-      content: `✅ Ownership of **${riotId}** verified — no ranked solo/duo entry this season yet, so no solo/duo rank role for now. You're linked though: once you play placements, your role will appear on its own.${fx ? ` (Flex noted: ${rankLabel({ tier: fx.tier, division: fx.rank })}.)` : ""}`,
+      content: `✅ Ownership of **${riotId}** verified — no ranked solo/duo entry this season yet, so no rank role for now. You're linked though: once you play placements, your role will appear on its own.`,
       embeds: [],
       components: [],
     });
@@ -688,12 +689,14 @@ async function processQueueEntry({
   variant,
   label,
   manageRoles,
+  visible,
 }) {
-  // First observation of this queue for a link that predates its tracking
-  // (the "tier" key is absent entirely, vs present-but-null = truly unranked
-  // at verify): adopt the current rank SILENTLY — no log line, no 🎉. This is
-  // what made the flex-rollout artifact a one-off instead of a rollout wave.
-  if (!("tier" in state)) {
+  // Silent paths — state updates, zero output: (1) first observation of a
+  // queue for a link that predates its tracking (the "tier" key absent
+  // entirely, vs present-but-null = truly unranked at verify), and (2) a queue
+  // tracked but not VISIBLE (flex, per Goonmaster: "Let's ignore flex rank" —
+  // we keep the data current so flipping it on later needs no backfill).
+  if (!("tier" in state) || !visible) {
     state.tier = entry.tier;
     state.division = entry.rank;
     state.lp = entry.leaguePoints;
@@ -809,6 +812,7 @@ async function refreshLink(uid, why) {
         variant: "solo",
         label: "",
         manageRoles: true,
+        visible: true,
       });
 
     const fx = entries.find((e) => e.queueType === "RANKED_FLEX_SR");
@@ -824,6 +828,7 @@ async function refreshLink(uid, why) {
         variant: "flex",
         label: " (Flex)",
         manageRoles: flexRoles,
+        visible: flexVisible,
       });
     }
 
