@@ -748,6 +748,37 @@ async function processQueueEntry({
   }
 }
 
+// PUUIDs are ENCRYPTED PER API KEY: swapping keys (dev -> personal, or any
+// rotation) silently invalidates every stored puuid — Riot answers 400 to
+// by-puuid calls. Self-heal: re-resolve the Riot ID under the current key and
+// carry on. A key rotation costs one extra call per link, once, automatically.
+const healing = new Set();
+async function healLink(uid, link) {
+  if (healing.has(uid)) return false;
+  healing.add(uid);
+  try {
+    const hash = link.riotId.indexOf("#");
+    const acct = await lookupAccount({
+      gameName: link.riotId.slice(0, hash),
+      tagLine: link.riotId.slice(hash + 1),
+    });
+    if (acct?.puuid && acct.puuid !== link.puuid) {
+      link.puuid = acct.puuid;
+      saveLinks();
+      log(
+        `healed puuid for ${link.riotId} (API-key change re-encrypts puuids)`,
+      );
+      return true;
+    }
+    return false;
+  } catch (e) {
+    log(`puuid heal failed for ${link.riotId}: ${e.message}`);
+    return false;
+  } finally {
+    healing.delete(uid);
+  }
+}
+
 // Re-pull one linked account — ONE Riot call covers both queues. Solo/duo
 // state lives on the link root (back-compat) and always manages roles; flex
 // lives under link.flex, always tracked/logged/celebrated, roles only behind
@@ -799,6 +830,12 @@ async function refreshLink(uid, why) {
     link.updatedAt = Date.now();
     saveLinks();
   } catch (e) {
+    if (e.status === 400) {
+      // Stale puuid from a key rotation — heal, then retry once.
+      if (await healLink(uid, link))
+        setTimeout(() => refreshLink(uid, why), 1000);
+      return;
+    }
     log(`refresh ${uid} (${why}) failed: ${e.message}`);
   } finally {
     refreshing.delete(uid);
@@ -884,7 +921,10 @@ async function pollLiveGames() {
         setTimeout(() => refreshLink(uid, "game ended"), 90_000);
       }
     } catch (e) {
-      log(`spectator poll (${link.riotId}) failed (non-fatal): ${e.message}`);
+      if (e.status === 400)
+        await healLink(uid, link); // stale puuid (key rotation) — next cycle works
+      else
+        log(`spectator poll (${link.riotId}) failed (non-fatal): ${e.message}`);
     }
     await new Promise((r) => setTimeout(r, 1500));
   }
