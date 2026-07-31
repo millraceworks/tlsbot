@@ -78,3 +78,8 @@ the icon can be switched back immediately after.
   ladder that never displaces solo roles.
 - `scripts/whoami.mjs` — token + guild sanity check. `register.mjs` — manual
   command re-registration (recovery only; normally automatic).
+
+## Legal
+
+TLSBot was created under Riot Games' "Legal Jibber Jabber" policy using assets
+owned by Riot Games. Riot Games does not endorse or sponsor this project.
