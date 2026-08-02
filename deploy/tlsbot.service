@@ -1,0 +1,17 @@
+[Unit]
+Description=TLSBot Discord rank bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=tlsbot-deploy
+WorkingDirectory=/home/tlsbot-deploy/tlsbot
+ExecStart=/usr/bin/node bot.mjs
+Restart=always
+RestartSec=5
+# exit 3 = another instance holds the singleton lock; 9 = bad Discord token.
+# Neither is fixable by respawning — stay down instead of crashlooping.
+RestartPreventExitStatus=3 9
+
+[Install]
+WantedBy=multi-user.target
