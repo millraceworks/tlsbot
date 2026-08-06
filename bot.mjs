@@ -17,8 +17,9 @@
 // (uploaded once by scripts/upload-emojis.mjs). When a guild has the boost-gated
 // ROLE_ICONS feature, /ranksetup also stamps the crest onto each role itself.
 //
-// Role changes carry X-Audit-Log-Reason, and each change is echoed to #bot-logging
-// (or LOG_CHANNEL_ID) when such a channel exists.
+// Role changes carry X-Audit-Log-Reason, and each change is echoed to the guild's
+// log channel — set per-server via /logsetup (falls back to LOG_CHANNEL_ID, then
+// to a channel named #bot-logging).
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { creds, ROOT } from "./lib/env.mjs";
@@ -138,11 +139,38 @@ const emojiText = (rank) =>
     ? `<:rank_${rank.key}:${appEmoji.get(rank.key)}>`
     : rank.emoji;
 
-// --- logging to #bot-logging ----------------------------------------------------
-const logChannels = new Map(); // guildId -> channelId | null
+// --- per-guild logging config + resolution --------------------------------------
+// The log channel is configurable PER SERVER: mods run /logsetup to pick it, and
+// the choice is persisted so it survives restarts. Resolution precedence, highest
+// first: (1) the channel a mod set via /logsetup [.guilds.json]; (2) the global
+// LOG_CHANNEL_ID env [legacy single-guild pin]; (3) a channel literally named
+// "bot-logging" [zero-config fallback, e.g. the sandbox]; (4) none -> logging off
+// for that guild until a mod configures it (the real server has no #bot-logging).
+const GUILDS_FILE = join(ROOT, ".guilds.json");
+let guildCfg = {}; // guildId -> { logChannelId?, celebrateChannelId? }
+try {
+  guildCfg = JSON.parse(readFileSync(GUILDS_FILE, "utf8"));
+} catch {
+  /* no per-guild config yet */
+}
+function saveGuildCfg() {
+  try {
+    writeFileSync(GUILDS_FILE, JSON.stringify(guildCfg, null, 2));
+  } catch {
+    /* best-effort */
+  }
+}
+
+const logChannels = new Map(); // guildId -> resolved channelId | null (cache)
 const guildFeatures = new Map(); // guildId -> Set of feature flags (ROLE_ICONS…)
 
+// Resolve + cache a guild's log channel from its GUILD_CREATE payload.
 function cacheLogChannel(guild) {
+  const configured = guildCfg[guild.id]?.logChannelId;
+  if (configured) {
+    logChannels.set(guild.id, configured);
+    return;
+  }
   if (logChannelId) {
     logChannels.set(guild.id, logChannelId);
     return;
@@ -162,9 +190,14 @@ function logLine(guildId, content) {
   );
 }
 
-// 🎉 promotion celebrations: CELEBRATE_CHANNEL_ID if set, else the log channel.
+// 🎉 promotion celebrations: a guild's milestone-channel override if it set one,
+// else the global CELEBRATE_CHANNEL_ID env, else the guild's own log channel
+// ("put it all in bot-logging" = set no override and milestones ride the logs).
 function celebrate(guildId, content) {
-  const ch = celebrateChannelId || logChannels.get(guildId);
+  const ch =
+    guildCfg[guildId]?.celebrateChannelId ||
+    celebrateChannelId ||
+    logChannels.get(guildId);
   if (!ch) return;
   rest("POST", `/channels/${ch}/messages`, { body: { content } }).catch((e) =>
     log(`celebrate post failed (non-fatal): ${e.message}`),
@@ -1056,6 +1089,67 @@ async function handleSetup(d) {
     );
 }
 
+// /logsetup #channel [#milestones] — mods pick this SERVER's log channel (and,
+// optionally, a separate milestones channel). We prove the bot can actually post
+// there before saving, so a silent 403 later can't leave logging quietly broken.
+async function handleLogSetup(d) {
+  await respond(d, { type: 5, data: { flags: 64 } }); // deferred ephemeral
+  const gid = d.guild_id;
+  const opts = Object.fromEntries(
+    (d.data.options || []).map((o) => [o.name, o.value]),
+  );
+  const logCh = opts.channel; // CHANNEL option value is the channel id
+  const msCh =
+    opts.milestones && opts.milestones !== logCh ? opts.milestones : null;
+
+  const postProbe = async (chId, note) => {
+    try {
+      await rest("POST", `/channels/${chId}/messages`, {
+        body: { content: note },
+      });
+      return null;
+    } catch (e) {
+      return e.status === 403 ? "I don't have access" : e.message;
+    }
+  };
+
+  let err = await postProbe(
+    logCh,
+    `✅ **TLSBot** log channel set by **${displayName(d.member)}** — rank changes${msCh ? "" : " and milestone promotions"} will post here.`,
+  );
+  if (err)
+    return editOriginal(d, {
+      content: `⚠️ ${err} in <#${logCh}>. Give my **TLSBot** role **View Channel** + **Send Messages** there, then run /logsetup again — nothing was saved.`,
+    });
+
+  if (msCh) {
+    err = await postProbe(
+      msCh,
+      `🏆 **TLSBot** milestone promotions (Master / Grandmaster / Challenger, solo/duo) will post here.`,
+    );
+    if (err)
+      return editOriginal(d, {
+        content: `⚠️ The log channel is fine, but ${err.toLowerCase()} in the milestones channel <#${msCh}>. Grant access there and re-run — nothing was saved.`,
+      });
+  }
+
+  guildCfg[gid] = {
+    ...(guildCfg[gid] || {}),
+    logChannelId: logCh,
+    celebrateChannelId: msCh, // null -> milestones ride the log channel
+  };
+  saveGuildCfg();
+  logChannels.set(gid, logCh); // update the live cache; no restart needed
+
+  return editOriginal(d, {
+    content:
+      `✅ Done. Rank-change logs → <#${logCh}>` +
+      (msCh
+        ? `, milestone promotions → <#${msCh}>.`
+        : ` (milestone promotions post there too).`),
+  });
+}
+
 async function onInteraction(d) {
   try {
     if (d.type === 2) {
@@ -1063,6 +1157,7 @@ async function onInteraction(d) {
       if (d.data.name === "verify") return await handleVerify(d);
       if (d.data.name === "ranksetup") return await handleSetup(d);
       if (d.data.name === "verifypanel") return await handleVerifyPanel(d);
+      if (d.data.name === "logsetup") return await handleLogSetup(d);
       return;
     }
     if (d.type === 3) {

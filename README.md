@@ -3,15 +3,17 @@
 Zero-dependency Discord bot (Node 22+, built-in `fetch` + `WebSocket`). Members
 prove they own a Riot ID (summoner-icon handshake); the bot pulls their REAL
 solo/duo rank from the Riot API, creates the colored rank roles, applies the
-matching one, keeps it current on its own, and logs every change to `#bot-logging`.
+matching one, keeps it current on its own, and logs every change to the server's
+log channel (configured per-server with `/logsetup`).
 
 ## Commands
 
-| Command        | Who  | What                                                                   |
-| -------------- | ---- | ---------------------------------------------------------------------- |
-| `/verify`      | all  | Prove you own a Riot ID (icon handshake), get your REAL solo/duo rank  |
-| `/verifypanel` | mods | Post the persistent **verify panel** (pin it) — button → Riot-ID modal |
-| `/ranksetup`   | mods | Create any missing rank roles — colored, zero permissions, unhoisted   |
+| Command        | Who  | What                                                                    |
+| -------------- | ---- | ----------------------------------------------------------------------- |
+| `/verify`      | all  | Prove you own a Riot ID (icon handshake), get your REAL solo/duo rank   |
+| `/verifypanel` | mods | Post the persistent **verify panel** (pin it) — button → Riot-ID modal  |
+| `/ranksetup`   | mods | Create any missing rank roles — colored, zero permissions, unhoisted    |
+| `/logsetup`    | mods | Pick this server's log channel (+ optional separate milestones channel) |
 
 There is deliberately no `/rank` command and **no self-report picker**: a rank
 role can only be earned by real verification. Members either run `/verify` or
@@ -62,9 +64,19 @@ the icon can be switched back immediately after.
   changes post 📈/📉 lines to `#bot-logging` (currently verbose incl. LP-only,
   for testing). No `/update` command — the automation makes it redundant. Riot
   has no push API; "realtime" is well-aimed polling.
-- **🎉 Promotion celebrations** — a tier promotion posts a congratulations
-  (with @mention) to `CELEBRATE_CHANNEL_ID` (default: the log channel), **once
-  per tier per split**: demote-then-repromote stays quiet (Goonmaster's spec).
+- **Per-server log channel** — the channel that receives rank-change lines (and,
+  by default, the milestone 🎉s) is configured **per guild** by a mod running
+  `/logsetup #channel`, persisted in `.guilds.json` so it survives restarts.
+  Resolution precedence: the `/logsetup` choice → `LOG_CHANNEL_ID` env → a channel
+  named `#bot-logging` → off. A brand-new server has no `#bot-logging`, so a mod
+  runs `/logsetup` once; until then logging is silently off (verification still
+  works). `/logsetup #logs #updates` routes milestones to a separate channel. On
+  set, the bot posts a confirmation line to prove it can actually write there —
+  a permissions gap is reported to the mod instead of failing silently later.
+- **🎉 Promotion celebrations** — a tier promotion posts a congratulations (with
+  @mention) to the guild's milestones channel — a `/logsetup` milestones override
+  if set, else `CELEBRATE_CHANNEL_ID`, else the log channel — **once per tier per
+  split**: demote-then-repromote stays quiet (Goonmaster's spec).
   Dedup state lives on the member's link under the current split key. **Split
   rollover is automatic**: a once-daily canary checks the Challenger ladder
   size (~300 all split, near-zero right after a reset); on collapse the bot

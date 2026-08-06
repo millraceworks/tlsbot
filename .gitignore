@@ -4,4 +4,6 @@
 .verify-pending.json
 .links.json
 .split.json
+.guilds.json
+.claude/
 node_modules/
