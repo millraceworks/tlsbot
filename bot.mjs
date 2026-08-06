@@ -5,13 +5,15 @@
 // answered via REST callbacks. Commands are (re-)registered idempotently per guild on
 // every GUILD_CREATE, so inviting the bot to a server is the ONLY setup step.
 //
-//   /verify     all  — Riot-ID rank verification: pulls the REAL solo/duo rank
-//                      from the Riot API and applies the crest role
-//   /ranksetup  mods — create any missing rank roles (colored, zero permissions)
-//   /rankpanel  mods — post the persistent picker panel (self-report fallback;
-//                      there is deliberately no /rank command)
+//   /verify      all  — Riot-ID rank verification: pulls the REAL solo/duo rank
+//                       from the Riot API and applies the crest role
+//   /verifypanel mods — post the persistent VERIFY panel: a button that opens a
+//                       Riot-ID modal and runs the exact same verification. This
+//                       is the ONLY path to a rank role — the old self-report
+//                       picker is retired, so nobody can hand themselves a rank.
+//   /ranksetup   mods — create any missing rank roles (colored, zero permissions)
 //
-// The picker shows Riot's official rank crests via APPLICATION-owned emojis
+// Rank messages show Riot's official rank crests via APPLICATION-owned emojis
 // (uploaded once by scripts/upload-emojis.mjs). When a guild has the boost-gated
 // ROLE_ICONS feature, /ranksetup also stamps the crest onto each role itself.
 //
@@ -27,7 +29,7 @@ import {
   RANK_NAME_SET,
   rolePayload,
 } from "./lib/ranks.mjs";
-import { COMMANDS } from "./lib/commands.mjs";
+import { COMMANDS, REGIONS } from "./lib/commands.mjs";
 import {
   lookupAccount,
   getSummoner,
@@ -48,6 +50,16 @@ const {
 
 const log = (m) =>
   process.stderr.write(`[tlsbot ${new Date().toISOString()}] ${m}\n`);
+
+// Valid League platform routing values — the /verify command constrains region
+// to a choice list, but the panel's modal is free text, so we validate it.
+const PLATFORMS = new Set(REGIONS.map(([, v]) => v));
+
+// Milestone tiers whose SOLO promotions post to the celebrate channel (Goonmaster
+// 2026-08-05: only Master / Grandmaster / Challenger, solo only, promotion only,
+// once per split). Everything below still logs to #bot-logging — it just never
+// posts to the public updates channel.
+const MILESTONE_TIERS = new Set(["MASTER", "GRANDMASTER", "CHALLENGER"]);
 
 // --- singleton lock (one gateway connection, ever) ------------------------------
 // Two live processes would both receive INTERACTION_CREATE and double-apply role
@@ -119,12 +131,8 @@ async function loadAppEmojis() {
   }
 }
 
-// Component-shaped emoji ({id} = custom crest, {name} = unicode fallback), and
-// the in-message-text form of the same.
-const emojiObj = (rank) =>
-  appEmoji.has(rank.key)
-    ? { id: appEmoji.get(rank.key), name: `rank_${rank.key}` }
-    : { name: rank.emoji };
+// In-message-text form of a rank's crest: the custom app emoji if we have it,
+// else the unicode glyph fallback.
 const emojiText = (rank) =>
   appEmoji.has(rank.key)
     ? `<:rank_${rank.key}:${appEmoji.get(rank.key)}>`
@@ -192,26 +200,7 @@ async function errorReply(d, content) {
   }
 }
 
-const selectRow = () => ({
-  type: 1,
-  components: [
-    {
-      type: 3,
-      custom_id: "rank:pick",
-      placeholder: "Select your rank…",
-      options: [
-        ...RANKS.map((r) => ({
-          label: r.name,
-          value: r.key,
-          emoji: emojiObj(r),
-        })),
-        { label: "Clear my rank", value: "clear", emoji: { name: "🧹" } },
-      ],
-    },
-  ],
-});
-
-// --- rank-role core (shared by the panel picker, /verify, and the refresher) ----
+// --- rank-role core (shared by /verify and the refresher) -----------------------
 // Swap the member onto the target rank role: remove every other rank role of
 // the SAME variant they hold, add the target (auto-creating it if missing),
 // return what was. variant "flex" uses a parallel "<Tier> (Flex)" role ladder,
@@ -245,60 +234,6 @@ async function swapToRank(gid, member, rankKey, reason, variant = "solo") {
 }
 
 // --- handlers -------------------------------------------------------------------
-async function handlePick(d) {
-  const gid = d.guild_id;
-  const member = d.member;
-  const uid = member.user.id;
-  const value = d.data.values?.[0];
-
-  let confirmation;
-  let wasNames = [];
-  if (value === "clear") {
-    const roles = await rest("GET", `/guilds/${gid}/roles`);
-    const have = new Set(member.roles);
-    const current = roles.filter(
-      (r) => RANK_NAME_SET.has(r.name) && have.has(r.id),
-    );
-    for (const r of current)
-      await rest("DELETE", `/guilds/${gid}/members/${uid}/roles/${r.id}`, {
-        reason: "rank cleared via panel",
-      });
-    wasNames = current.map((r) => r.name);
-    confirmation = current.length
-      ? "🧹 Rank cleared."
-      : "You had no rank role to clear.";
-  } else {
-    const { rank, was } = await swapToRank(
-      gid,
-      member,
-      value,
-      "rank picked via panel",
-    );
-    wasNames = was;
-    confirmation = `${emojiText(rank)} You're now **${rank.name}**.`;
-  }
-
-  // From the ephemeral /rank flow: update that message in place. From a shared
-  // panel: never touch the panel — send a fresh ephemeral confirmation instead.
-  const ephemeralSource = ((d.message?.flags ?? 0) & 64) !== 0;
-  await respond(
-    d,
-    ephemeralSource
-      ? { type: 7, data: { content: confirmation, components: [] } }
-      : { type: 4, data: { flags: 64, content: confirmation } },
-  );
-
-  const was = wasNames.join(", ");
-  logLine(
-    gid,
-    value === "clear"
-      ? `🧹 **${displayName(member)}** cleared their rank${was ? ` (was ${was})` : ""}`
-      : `${emojiText(RANK_BY_KEY.get(value))} **${displayName(member)}** → **${RANK_BY_KEY.get(value).name}**${
-          was && was !== RANK_BY_KEY.get(value).name ? ` (was ${was})` : ""
-        }`,
-  );
-}
-
 // /verify riot_id:<Name#TAG> [region] — the flagship: pull the REAL solo/duo
 // rank from the Riot API and apply the crest role. Self-reported rank is junk
 // data; this is the thing native onboarding and off-the-shelf bots don't do.
@@ -342,14 +277,12 @@ const riotErrorText = (e, who, platform) => {
   return null;
 };
 
-async function handleVerify(d) {
-  // Riot round-trips can outrun the 3s callback window — defer immediately.
-  await respond(d, { type: 5, data: { flags: 64 } });
-  const opts = Object.fromEntries(
-    (d.data.options || []).map((o) => [o.name, o.value]),
-  );
-  const platform = opts.region || "na1";
-  const raw = String(opts.riot_id || "").trim();
+// The shared verification core. Both entry points — the /verify slash command
+// and the panel's Riot-ID modal — defer an ephemeral reply FIRST, then hand the
+// raw Riot ID + platform here; everything the member sees (icon challenge, Check
+// button, errors) is edited onto that deferred message via editOriginal(d, …).
+async function startVerification(d, rawRiotId, platform) {
+  const raw = String(rawRiotId || "").trim();
   const hash = raw.indexOf("#");
   if (hash < 1 || hash === raw.length - 1)
     return editOriginal(d, {
@@ -409,6 +342,113 @@ async function handleVerify(d) {
     if (friendly) return editOriginal(d, { content: friendly });
     throw e; // anything else -> onInteraction's catch (errorReply edits the deferred msg)
   }
+}
+
+// /verify riot_id:<Name#TAG> [region] — the slash entry point.
+async function handleVerify(d) {
+  // Riot round-trips can outrun the 3s callback window — defer immediately.
+  await respond(d, { type: 5, data: { flags: 64 } });
+  const opts = Object.fromEntries(
+    (d.data.options || []).map((o) => [o.name, o.value]),
+  );
+  return startVerification(d, opts.riot_id, opts.region || "na1");
+}
+
+// /verifypanel — post the persistent VERIFY panel (mods). One public message with
+// a single button; each click opens a private modal, so the panel stays clean and
+// every member's verification is their own ephemeral thread. This replaces the old
+// self-report picker: a rank role can now only come from real Riot verification.
+async function handleVerifyPanel(d) {
+  await respond(d, {
+    type: 4,
+    data: {
+      content:
+        "**Verify your League rank** 🛡️\n" +
+        "Click **Verify my rank**, enter your Riot ID (`Name#TAG`), and do a quick one-time " +
+        "summoner-icon check to prove the account is yours. Your **real** solo/duo rank is then " +
+        "pulled straight from Riot and the matching role is applied automatically.\n" +
+        "-# No self-reporting — every rank here is verified against the Riot API.",
+      components: [
+        {
+          type: 1,
+          components: [
+            {
+              type: 2,
+              style: 1,
+              label: "Verify my rank",
+              custom_id: "verify:start",
+              emoji: { name: "✅" },
+            },
+          ],
+        },
+      ],
+    },
+  });
+  logLine(
+    d.guild_id,
+    `📌 **${displayName(d.member)}** posted the verify panel in <#${d.channel_id}>`,
+  );
+}
+
+// Panel button click -> open the Riot-ID modal. Respond with the modal directly
+// (type 9): a modal is NOT deferrable, so no ack precedes it.
+async function handleVerifyStart(d) {
+  return respond(d, {
+    type: 9,
+    data: {
+      custom_id: "verify:modal",
+      title: "Verify your League rank",
+      components: [
+        {
+          type: 1,
+          components: [
+            {
+              type: 4, // text input
+              custom_id: "riot_id",
+              style: 1,
+              label: "Riot ID (Name#TAG)",
+              placeholder: "Faker#KR1",
+              min_length: 3,
+              max_length: 40,
+              required: true,
+            },
+          ],
+        },
+        {
+          type: 1,
+          components: [
+            {
+              type: 4,
+              custom_id: "region",
+              style: 1,
+              label: "Region (leave blank for NA)",
+              placeholder: "na1 / euw1 / kr / br1 …",
+              max_length: 8,
+              required: false,
+            },
+          ],
+        },
+      ],
+    },
+  });
+}
+
+// Modal submit -> validate the region, then run the identical verification core.
+async function handleVerifyModal(d) {
+  await respond(d, { type: 5, data: { flags: 64 } }); // deferred ephemeral
+  const fields = {};
+  for (const row of d.data.components || [])
+    for (const c of row.components || []) fields[c.custom_id] = c.value;
+  const region = String(fields.region || "")
+    .trim()
+    .toLowerCase();
+  if (region && !PLATFORMS.has(region))
+    return editOriginal(d, {
+      content:
+        `⚠️ Unknown region "${region}". Leave it blank for NA, or use one of: ` +
+        `${REGIONS.map(([, v]) => v).join(", ")}.`,
+    });
+  return startVerification(d, fields.riot_id, region || "na1");
 }
 
 // Complete a proven challenge: pull the rank, swap the role, update the
@@ -730,15 +770,26 @@ async function processQueueEntry({
       link.gid,
       `${up ? "📈" : "📉"} ${emojiText(rank)} **${displayName(member)}** ${up ? "climbed" : "fell"}${label}: **${beforeLabel}** → **${rankLabel(state)}** (${entry.leaguePoints} LP)`,
     );
-    if (changedTier && tierIndexOf(state.tier) > tierIndexOf(beforeTier)) {
+    // Milestone celebration -> the public updates channel (CELEBRATE_CHANNEL_ID).
+    // Spec (Goonmaster 2026-08-05): SOLO/DUO only, Master/GM/Challenger only,
+    // promotion only (this branch is already promotion-gated), once per split
+    // (the dedup below; demote -> re-promote within a split stays quiet). Lower
+    // tiers and flex still log to #bot-logging above — they just never post here.
+    const promoted =
+      changedTier && tierIndexOf(state.tier) > tierIndexOf(beforeTier);
+    if (promoted && variant === "solo" && MILESTONE_TIERS.has(state.tier)) {
       link.celebrated ??= {};
       const done = (link.celebrated[currentSplit()] ??= []);
-      const dedupKey = variant === "flex" ? `${state.tier}-flex` : state.tier;
-      if (!done.includes(dedupKey)) {
-        done.push(dedupKey);
+      if (!done.includes(state.tier)) {
+        done.push(state.tier);
+        // Persist the dedup + the new tier NOW, before the celebrate POST and
+        // before the (later) flex pass — otherwise a flex-branch throw or a
+        // restart in that window re-observes the same promotion and double-posts
+        // the milestone. refreshLink() saves again at the end; this is the guard.
+        saveLinks();
         celebrate(
           link.gid,
-          `🎉 ${emojiText(rank)} <@${uid}> just hit **${rank.name}**${variant === "flex" ? " in **Flex**" : ""} for the first time this split — GGs! 🏆 (${link.riotId})`,
+          `🎉 ${emojiText(rank)} <@${uid}> just hit **${rank.name}** in Solo/Duo for the first time this split — GGs! 🏆 (${link.riotId})`,
         );
       }
     }
@@ -1005,33 +1056,40 @@ async function handleSetup(d) {
     );
 }
 
-async function handlePanel(d) {
-  await respond(d, {
-    type: 4,
-    data: {
-      content:
-        "**Choose your League rank**\nPick from the menu below — your old rank role is swapped out automatically. Come back here any time to change it.",
-      components: [selectRow()],
-    },
-  });
-  logLine(
-    d.guild_id,
-    `📌 **${displayName(d.member)}** posted a rank panel in <#${d.channel_id}>`,
-  );
-}
-
 async function onInteraction(d) {
   try {
     if (d.type === 2) {
+      // APPLICATION_COMMAND
       if (d.data.name === "verify") return await handleVerify(d);
       if (d.data.name === "ranksetup") return await handleSetup(d);
-      if (d.data.name === "rankpanel") return await handlePanel(d);
+      if (d.data.name === "verifypanel") return await handleVerifyPanel(d);
       return;
     }
-    if (d.type === 3 && d.data.custom_id === "rank:pick")
-      return await handlePick(d);
-    if (d.type === 3 && d.data.custom_id === "verify:check")
-      return await handleVerifyCheck(d);
+    if (d.type === 3) {
+      // MESSAGE_COMPONENT (button / select)
+      if (d.data.custom_id === "verify:start")
+        return await handleVerifyStart(d);
+      if (d.data.custom_id === "verify:check")
+        return await handleVerifyCheck(d);
+      // Retired self-report picker: any lingering panel message clicks land here.
+      // Answer gracefully instead of failing, and point them at verification.
+      if (d.data.custom_id === "rank:pick")
+        return await respond(d, {
+          type: 4,
+          data: {
+            flags: 64,
+            content:
+              "Rank self-report has been turned off — use the **Verify my rank** button on the verify panel to get your real solo/duo rank, pulled straight from Riot.",
+          },
+        });
+      return;
+    }
+    if (d.type === 5) {
+      // MODAL_SUBMIT
+      if (d.data.custom_id === "verify:modal")
+        return await handleVerifyModal(d);
+      return;
+    }
   } catch (e) {
     log(`interaction failed: ${e.message}`);
     await errorReply(

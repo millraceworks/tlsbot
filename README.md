@@ -1,22 +1,23 @@
 # TLSBot — League rank self-role bot
 
-Zero-dependency Discord bot (Node 22+, built-in `fetch` + `WebSocket`). Members pick
-their League of Legends rank from a select menu; the bot creates the colored rank
-roles, swaps the old rank out, and logs every change to `#bot-logging`.
+Zero-dependency Discord bot (Node 22+, built-in `fetch` + `WebSocket`). Members
+prove they own a Riot ID (summoner-icon handshake); the bot pulls their REAL
+solo/duo rank from the Riot API, creates the colored rank roles, applies the
+matching one, keeps it current on its own, and logs every change to `#bot-logging`.
 
 ## Commands
 
-| Command      | Who  | What                                                                  |
-| ------------ | ---- | --------------------------------------------------------------------- |
-| `/verify`    | all  | Prove you own a Riot ID (icon handshake), get your REAL solo/duo rank |
-| `/ranksetup` | mods | Create any missing rank roles — colored, zero permissions, unhoisted  |
-| `/rankpanel` | mods | Post the persistent picker panel (pin it) — self-report fallback      |
+| Command        | Who  | What                                                                   |
+| -------------- | ---- | ---------------------------------------------------------------------- |
+| `/verify`      | all  | Prove you own a Riot ID (icon handshake), get your REAL solo/duo rank  |
+| `/verifypanel` | mods | Post the persistent **verify panel** (pin it) — button → Riot-ID modal |
+| `/ranksetup`   | mods | Create any missing rank roles — colored, zero permissions, unhoisted   |
 
-There is deliberately no `/rank` command (owner preference): the panel covers
-self-reported picks (Iron → Challenger, plus "Clear my rank"), and `/verify` is
-the flagship — the rank comes from the Riot API (`RIOT_API_KEY` in `.env`,
-re-read on every call so rotating the 24h dev key needs no restart), not from
-the member's imagination.
+There is deliberately no `/rank` command and **no self-report picker**: a rank
+role can only be earned by real verification. Members either run `/verify` or
+click **Verify my rank** on the panel; either way the rank comes from the Riot
+API (`RIOT_API_KEY` in `.env`, re-read on every call so rotating the 24h dev key
+needs no restart), never from the member's imagination.
 
 `/verify` enforces **ownership**, not just existence: it challenges the member
 to switch their summoner icon to a random starter icon (never the one they're
@@ -34,8 +35,8 @@ the icon can be switched back immediately after.
 
 ## Design notes
 
-- **Official Riot crests everywhere** — the picker, confirmations, and log lines
-  use Riot's ranked emblems (from the official developer asset pack) uploaded as
+- **Official Riot crests everywhere** — verification replies, confirmations, and
+  log lines use Riot's ranked emblems (from the official developer asset pack) uploaded as
   **application-owned emojis** (`scripts/upload-emojis.mjs`, idempotent). App
   emojis work in ANY server with zero boost requirement and consume no guild
   emoji slots. Where a guild has the boost-gated `ROLE_ICONS` feature (level 2),
@@ -45,7 +46,7 @@ the icon can be switched back immediately after.
   the bot never reads messages or the member list.
 - **Rank roles carry `permissions: "0"`** and are created _by_ the bot, so they
   land below the bot's own role and hierarchy always works. If roles were made by
-  hand above the bot's role, the picker replies with the exact drag-to-fix hint.
+  hand above the bot's role, verification replies with the exact drag-to-fix hint.
 - **Every role change carries `X-Audit-Log-Reason`** — attributable in the
   server's audit log, plus a human-readable line in `#bot-logging`.
 - **Ranks stay current on their own** — a successful `/verify` stores a link
