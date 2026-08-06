@@ -1099,53 +1099,69 @@ async function handleLogSetup(d) {
     (d.data.options || []).map((o) => [o.name, o.value]),
   );
   const logCh = opts.channel; // CHANNEL option value is the channel id
-  const msCh =
-    opts.milestones && opts.milestones !== logCh ? opts.milestones : null;
+  const passedMs = opts.milestones !== undefined;
+  // The milestones destination in effect AFTER this run: an explicitly-passed
+  // separate channel, else (mod passed nothing) whatever was configured before —
+  // so moving just the log channel never silently wipes a separate milestones one.
+  // null => milestones ride the log channel.
+  const effMs = passedMs
+    ? opts.milestones !== logCh
+      ? opts.milestones
+      : null
+    : (guildCfg[gid]?.celebrateChannelId ?? null);
+  // Only a NEWLY-supplied separate channel needs a permission probe this run.
+  const newMsCh = passedMs && effMs ? effMs : null;
 
+  // A probe IS a real post proving we can write there; capture the message id so a
+  // later failure can roll it back — never leave a misleading public confirmation.
   const postProbe = async (chId, note) => {
     try {
-      await rest("POST", `/channels/${chId}/messages`, {
+      const m = await rest("POST", `/channels/${chId}/messages`, {
         body: { content: note },
       });
-      return null;
+      return { id: m?.id };
     } catch (e) {
-      return e.status === 403 ? "I don't have access" : e.message;
+      return { err: e.status === 403 ? "I don't have access" : e.message };
     }
   };
+  const undoProbe = (chId, id) =>
+    id && rest("DELETE", `/channels/${chId}/messages/${id}`).catch(() => {});
 
-  let err = await postProbe(
+  const logPost = await postProbe(
     logCh,
-    `✅ **TLSBot** log channel set by **${displayName(d.member)}** — rank changes${msCh ? "" : " and milestone promotions"} will post here.`,
+    `✅ **TLSBot** log channel set by **${displayName(d.member)}** — rank changes${effMs ? "" : " and milestone promotions"} will post here.`,
   );
-  if (err)
+  if (logPost.err)
     return editOriginal(d, {
-      content: `⚠️ ${err} in <#${logCh}>. Give my **TLSBot** role **View Channel** + **Send Messages** there, then run /logsetup again — nothing was saved.`,
+      content: `⚠️ ${logPost.err} in <#${logCh}>. Give my **TLSBot** role **View Channel** + **Send Messages** there, then run /logsetup again — nothing was saved.`,
     });
 
-  if (msCh) {
-    err = await postProbe(
-      msCh,
+  if (newMsCh) {
+    const msPost = await postProbe(
+      newMsCh,
       `🏆 **TLSBot** milestone promotions (Master / Grandmaster / Challenger, solo/duo) will post here.`,
     );
-    if (err)
+    if (msPost.err) {
+      await undoProbe(logCh, logPost.id); // roll back the log post — nothing saved
       return editOriginal(d, {
-        content: `⚠️ The log channel is fine, but ${err.toLowerCase()} in the milestones channel <#${msCh}>. Grant access there and re-run — nothing was saved.`,
+        content: `⚠️ The log channel is fine, but ${msPost.err.toLowerCase()} in the milestones channel <#${newMsCh}>. Grant access there and re-run — nothing was saved.`,
       });
+    }
   }
 
-  guildCfg[gid] = {
-    ...(guildCfg[gid] || {}),
-    logChannelId: logCh,
-    celebrateChannelId: msCh, // null -> milestones ride the log channel
-  };
+  // Persist. Only touch celebrateChannelId when the mod actually passed a
+  // milestones arg, so re-running to move just the logs preserves a separate one.
+  const cfg = { ...(guildCfg[gid] || {}), logChannelId: logCh };
+  if (passedMs) cfg.celebrateChannelId = effMs;
+  guildCfg[gid] = cfg;
   saveGuildCfg();
   logChannels.set(gid, logCh); // update the live cache; no restart needed
 
   return editOriginal(d, {
     content:
       `✅ Done. Rank-change logs → <#${logCh}>` +
-      (msCh
-        ? `, milestone promotions → <#${msCh}>.`
+      (effMs
+        ? `, milestone promotions → <#${effMs}>.`
         : ` (milestone promotions post there too).`),
   });
 }
