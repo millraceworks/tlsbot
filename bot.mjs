@@ -423,6 +423,63 @@ async function handleVerifyPanel(d) {
   );
 }
 
+// "Add Verify panel" (message context-menu, mods) — the "copy your post and repost
+// it" path. Interactive components can ONLY live on a message the app authored, so
+// the bot can't inject the button into a human's hand-typed rules message. Instead
+// it re-posts the targeted message's text as a bot message with the Verify button
+// attached; the mod then deletes the original, leaving one clean rules+button post.
+// The text rides in on the interaction (data.resolved) — no fetch, so this works
+// even before the bot has Read Message History in the channel.
+async function handleVerifyPanelFromMessage(d) {
+  await respond(d, { type: 5, data: { flags: 64 } }); // ack privately
+  const msg = d.data.resolved?.messages?.[d.data.target_id];
+  const content = (msg?.content || "").trim();
+  const embeds = Array.isArray(msg?.embeds) ? msg.embeds : [];
+  if (!content && embeds.length === 0)
+    return editOriginal(d, {
+      content:
+        "That message has no copyable text — point me at the message that holds your rules text (not an image- or attachment-only post), or run **/verifypanel** to post a fresh panel instead.",
+    });
+  if (content.length > 2000)
+    return editOriginal(d, {
+      content:
+        "That message is over Discord's 2000-character limit for a single message, so I can't repost it as one. Trim it (or split the rules across two messages), then try again.",
+    });
+  const button = {
+    type: 1,
+    components: [
+      {
+        type: 2,
+        style: 1,
+        label: "Verify my rank",
+        custom_id: "verify:start",
+        emoji: { name: "✅" },
+      },
+    ],
+  };
+  const body = { components: [button] };
+  if (content) body.content = content;
+  else body.embeds = embeds; // image/embed-only source: carry the embeds across
+  try {
+    await rest("POST", `/channels/${d.channel_id}/messages`, { body });
+  } catch (e) {
+    return editOriginal(d, {
+      content:
+        e.status === 403
+          ? "⚠️ I don't have **View Channel** + **Send Messages** in this channel. Grant those to my **TLSBot** role here, then try again — nothing was posted."
+          : `⚠️ Couldn't post the panel here: ${e.message}`,
+    });
+  }
+  logLine(
+    d.guild_id,
+    `📌 **${displayName(d.member)}** reposted a message as the verify panel in <#${d.channel_id}>`,
+  );
+  return editOriginal(d, {
+    content:
+      "✅ Reposted your text with the **Verify my rank** button attached. Once it looks right, **delete the original message** so there's just one copy — and pin the new one if you like.",
+  });
+}
+
 // Panel button click -> open the Riot-ID modal. Respond with the modal directly
 // (type 9): a modal is NOT deferrable, so no ack precedes it.
 async function handleVerifyStart(d) {
@@ -1181,6 +1238,8 @@ async function onInteraction(d) {
       if (d.data.name === "verify") return await handleVerify(d);
       if (d.data.name === "ranksetup") return await handleSetup(d);
       if (d.data.name === "verifypanel") return await handleVerifyPanel(d);
+      if (d.data.name === "Add Verify panel")
+        return await handleVerifyPanelFromMessage(d);
       if (d.data.name === "logsetup") return await handleLogSetup(d);
       return;
     }
