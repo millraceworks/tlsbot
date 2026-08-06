@@ -433,33 +433,33 @@ async function handleVerifyStart(d) {
       title: "Verify your League rank",
       components: [
         {
-          type: 1,
-          components: [
-            {
-              type: 4, // text input
-              custom_id: "riot_id",
-              style: 1,
-              label: "Riot ID (Name#TAG)",
-              placeholder: "Faker#KR1",
-              min_length: 3,
-              max_length: 40,
-              required: true,
-            },
-          ],
+          type: 18, // Label — the modern modal wrapper (recommended over action rows)
+          label: "Riot ID (Name#TAG)",
+          component: {
+            type: 4, // text input
+            custom_id: "riot_id",
+            style: 1,
+            placeholder: "Faker#KR1",
+            min_length: 3,
+            max_length: 40,
+            required: true,
+          },
         },
         {
-          type: 1,
-          components: [
-            {
-              type: 4,
-              custom_id: "region",
-              style: 1,
-              label: "Region (leave blank for NA)",
-              placeholder: "na1 / euw1 / kr / br1 …",
-              max_length: 8,
-              required: false,
-            },
-          ],
+          type: 18, // Label
+          label: "Region",
+          description: "Defaults to NA — change it only if you play elsewhere.",
+          component: {
+            // The region list is fixed, so a dropdown beats free text (no typos),
+            // with NA pre-selected as the default.
+            type: 3, // string select
+            custom_id: "region",
+            options: REGIONS.map(([name, value]) => ({
+              label: name,
+              value,
+              default: value === "na1",
+            })),
+          },
         },
       ],
     },
@@ -470,16 +470,24 @@ async function handleVerifyStart(d) {
 async function handleVerifyModal(d) {
   await respond(d, { type: 5, data: { flags: 64 } }); // deferred ephemeral
   const fields = {};
-  for (const row of d.data.components || [])
-    for (const c of row.components || []) fields[c.custom_id] = c.value;
+  // Modal inputs are Label-wrapped (type 18 -> `component`, singular): a text
+  // input exposes `.value`, a select exposes `.values`. Also tolerate the legacy
+  // action-row shape (`.components[]`) so an in-flight old modal never breaks.
+  const read = (c) => {
+    if (c?.custom_id)
+      fields[c.custom_id] =
+        c.value ?? (Array.isArray(c.values) ? c.values[0] : undefined);
+  };
+  for (const row of d.data.components || []) {
+    if (row.component) read(row.component);
+    for (const c of row.components || []) read(c);
+  }
   const region = String(fields.region || "")
     .trim()
     .toLowerCase();
   if (region && !PLATFORMS.has(region))
     return editOriginal(d, {
-      content:
-        `⚠️ Unknown region "${region}". Leave it blank for NA, or use one of: ` +
-        `${REGIONS.map(([, v]) => v).join(", ")}.`,
+      content: `⚠️ Unrecognized region "${region}". Pick one from the dropdown and try again.`,
     });
   return startVerification(d, fields.riot_id, region || "na1");
 }
